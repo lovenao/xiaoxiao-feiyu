@@ -1,0 +1,18 @@
+{
+  "providers": [],
+  "prompts": [],
+  "active_prompt_id": "",
+  "settings": {
+    "memory": {
+      "enabled": false,
+      "provider_id": "",
+      "model_id": "",
+      "review_prompt": ""
+    },
+    "web": {
+      "enabled": false,
+      "api_key": "",
+      "max_results": 10
+    }
+  }
+}

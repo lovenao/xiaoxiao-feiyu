@@ -106,6 +106,24 @@ COMPRESS_SYSTEM_PROMPT = (
     "用简体中文分条输出。"
 )
 
+FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_RESULT_MARKDOWN_CHARS = 12_000
+WEB_TOTAL_CONTEXT_CHARS = 36_000
+TOOL_MAX_ROUNDS = 3
+DEFAULT_TOOL_INSTRUCTIONS = (
+    "你可以使用工具获取外部信息。只有当问题需要实时、网络上才有的信息，或用户明确要求搜索时，才调用 web_search。"
+    "普通问答、写作、代码和数学推导不要搜索。调用工具前不要让用户确认，直接使用；需要搜索时必须在本轮立即调用 web_search，不要只回复“我来查一下”然后结束。不要编造工具结果。"
+    "回答时如果使用了搜索结果，必须在相关陈述后附 Markdown 链接来源。"
+)
+
+
+def default_settings() -> dict:
+    return {
+        "memory": {"enabled": False},
+        "web": {"enabled": False, "api_key": "", "max_results": WEB_SEARCH_MAX_RESULTS},
+    }
+
 CONTEXT_ERROR_MARKERS = (
     "context length",
     "context_length_exceeded",
@@ -221,6 +239,13 @@ def load_config() -> dict:
         data = {"providers": []}
     if not isinstance(data.get("providers"), list):
         data["providers"] = []
+    defaults = default_settings()
+    settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+    merged = {}
+    for section, values in defaults.items():
+        current = settings.get(section) if isinstance(settings.get(section), dict) else {}
+        merged[section] = {**values, **current}
+    data["settings"] = merged
     data["prompts"] = _normalize_prompts(data.get("prompts"))
     prompt_ids = {str(item.get("id")) for item in data["prompts"]}
     active = str(data.get("active_prompt_id") or "")
@@ -231,6 +256,12 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
+    defaults = default_settings()
+    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
+    config["settings"] = {}
+    for section, values in defaults.items():
+        current = settings.get(section) if isinstance(settings.get(section), dict) else {}
+        config["settings"][section] = {**values, **current}
     config["prompts"] = _normalize_prompts(config.get("prompts"))
     prompt_ids = {str(item.get("id")) for item in config["prompts"]}
     if str(config.get("active_prompt_id") or "") not in prompt_ids:
@@ -1076,10 +1107,22 @@ def normalize_usage(raw: dict | None) -> dict | None:
     }
 
 
+def build_environment_note() -> str:
+    local = datetime.now().astimezone()
+    offset = local.strftime("%z")
+    tz = f"UTC{offset[:3]}:{offset[3:]}" if offset else (local.tzname() or "local")
+    return f"当前日期：{local:%Y-%m-%d}\n当前时间：{local:%H:%M}（{tz}）"
+
+
 def build_upstream_messages(conv: dict, exclude_turn_index: int | None = None) -> list[dict]:
     # 每轮对话绑定创建时选中的提示词原文，后续修改预设不会改变旧对话。
     system_text = str(conv.get("system_prompt") or SYSTEM_PROMPT).strip() or SYSTEM_PROMPT
-    messages = [{"role": "system", "content": system_text}]
+    # 这一段工具规则始终固定，开关只决定是否允许执行工具，避免破坏前缀缓存。
+    tool_rules = str(conv.get("tool_instructions") or DEFAULT_TOOL_INSTRUCTIONS).strip()
+    environment_note = str(conv.get("environment") or "").strip() or build_environment_note()
+    messages = [{"role": "system", "content": tool_rules}]
+    messages.append({"role": "system", "content": environment_note})
+    messages.append({"role": "system", "content": system_text})
     digest = conv.get("digest") or {}
     digest_text = str(digest.get("text") or "").strip()
     if digest_text:
@@ -1243,7 +1286,33 @@ def _turns_transcript(turns: list[tuple[dict, list[dict]]], limit_chars: int = 1
     return "\n\n".join(parts)
 
 
-def build_chat_payload(model: str, messages: list[dict], effort: str) -> dict:
+def web_search_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "搜索公开网络并读取搜索结果的正文。仅在需要实时信息、外部资料或用户明确要求搜索时使用。"
+                "普通知识问答、写作、代码和数学计算不要使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "简洁、具体的搜索关键词"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def build_chat_payload(
+    model: str,
+    messages: list[dict],
+    effort: str,
+    tools: list[dict] | None = None,
+) -> dict:
     payload = {
         "model": model,
         "messages": messages,
@@ -1252,7 +1321,147 @@ def build_chat_payload(model: str, messages: list[dict], effort: str) -> dict:
     }
     if effort:
         payload["reasoning_effort"] = effort
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     return payload
+
+
+def _extract_firecrawl_results(data: dict, max_results: int) -> list[dict]:
+    candidates = []
+    if isinstance(data.get("data"), dict):
+        for key in ("web", "results", "links"):
+            if isinstance(data["data"].get(key), list):
+                candidates = data["data"][key]
+                break
+    elif isinstance(data.get("data"), list):
+        candidates = data["data"]
+    elif isinstance(data.get("results"), list):
+        candidates = data["results"]
+    results = []
+    for item in candidates[:max_results]:
+        if not isinstance(item, dict):
+            continue
+        markdown = item.get("markdown") or item.get("content") or ""
+        if isinstance(markdown, dict):
+            markdown = markdown.get("markdown") or markdown.get("text") or ""
+        description = item.get("description") or item.get("snippet") or item.get("summary") or ""
+        page_url = str(item.get("url") or item.get("link") or "")[:2000]
+        try:
+            if urlparse(page_url).scheme.lower() not in ("http", "https"):
+                continue
+        except Exception:
+            continue
+        results.append(
+            {
+                "title": str(item.get("title") or item.get("name") or "未命名页面")[:300],
+                "url": page_url,
+                "description": str(description)[:1200],
+                "markdown": str(markdown)[:WEB_RESULT_MARKDOWN_CHARS],
+            }
+        )
+    return results
+
+
+def firecrawl_search(api_key: str, query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list[dict]:
+    body = json.dumps(
+        {
+            "query": query,
+            "limit": max(1, min(WEB_SEARCH_MAX_RESULTS, int(max_results or WEB_SEARCH_MAX_RESULTS))),
+            "scrapeOptions": {"formats": ["markdown"], "onlyMainContent": True},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = request.Request(
+        FIRECRAWL_SEARCH_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"XiaoXiaoFatFish/{VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=60, context=ssl.create_default_context()) as resp:
+            raw = resp.read(8 * 1024 * 1024)
+    except error.HTTPError as exc:
+        detail = _extract_error_message(exc.read())
+        raise UpstreamError(f"Firecrawl 搜索失败（{exc.code}）：{detail}", exc.code, detail) from exc
+    except error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise UpstreamError(f"无法连接 Firecrawl：{reason}") from exc
+    except TimeoutError as exc:
+        raise UpstreamError("Firecrawl 搜索等待超过 60 秒") from exc
+    try:
+        data = json.loads(_decode_body(raw))
+    except json.JSONDecodeError as exc:
+        raise UpstreamError("Firecrawl 返回的不是有效 JSON") from exc
+    if not isinstance(data, dict) or data.get("success") is False:
+        detail = _extract_error_message(raw)
+        raise UpstreamError(f"Firecrawl 搜索失败：{detail}")
+    results = _extract_firecrawl_results(data, max_results)
+    if not results:
+        raise UpstreamError("Firecrawl 没有返回搜索结果")
+    return results
+
+
+def normalize_tool_calls(calls: list) -> list[dict]:
+    normalized = []
+    for index, call in enumerate(calls):
+        if not isinstance(call, dict):
+            continue
+        call_id = str(call.get("id") or f"call_{index}")
+        function = call.get("function") or {}
+        name = str(function.get("name") or "")
+        raw_args = function.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            args = {}
+        normalized.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False),
+                },
+                "_args": args if isinstance(args, dict) else {},
+            }
+        )
+    return normalized
+
+
+def execute_web_tool(call: dict, api_key: str, max_results: int) -> tuple[str, list[dict]]:
+    if call["function"]["name"] != "web_search":
+        return f"未知工具：{call['function']['name']}", []
+    query = str(call["_args"].get("query") or "").strip()
+    if not query:
+        return "搜索失败：query 不能为空", []
+    try:
+        results = firecrawl_search(api_key, query, max_results)
+    except UpstreamError as exc:
+        return f"搜索失败：{exc.message}", []
+    sources = [{"title": item["title"], "url": item["url"]} for item in results]
+    return format_web_results(results), sources
+
+
+def format_web_results(results: list[dict]) -> str:
+    parts = []
+    used = 0
+    for index, item in enumerate(results, 1):
+        body = item.get("markdown") or item.get("description") or ""
+        remain = WEB_TOTAL_CONTEXT_CHARS - used
+        if remain <= 0:
+            break
+        body = body[:remain]
+        used += len(body)
+        parts.append(
+            f"[{index}] {item.get('title')}\nURL: {item.get('url')}\n{body}"
+        )
+    return "\n\n---\n\n".join(parts)
 
 
 def _open_chat_stream(provider: dict, payload: dict):
@@ -1282,14 +1491,254 @@ def _optional_parameter_error(exc: UpstreamError) -> bool:
     markers = (
         "stream_options", "reasoning_effort", "reasoning", "unsupported", "not supported",
         "unknown parameter", "unexpected keyword", "extra inputs", "unrecognized",
+        "tools", "tool_choice", "function calling", "function_call",
     )
     return exc.status in (400, 422) and any(marker in text for marker in markers)
 
 
-def stream_chat(provider: dict, model: str, messages: list[dict], effort: str):
+WEB_SEARCH_HINTS = (
+    "搜索", "搜一下", "搜搜", "联网查", "查一下最新", "最新", "实时",
+    "今天", "明天", "后天", "现在", "新闻", "天气", "气温", "价格",
+    "汇率", "股价", "比分", "发布", "上映", "刚刚",
+)
+
+
+def contains_tool_markup(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "dsml" in lowered or (
+        "web_search" in lowered and ("invoke" in lowered or "tool_calls" in lowered or "parameter name" in lowered)
+    )
+
+
+def clean_search_query(text: str) -> str:
+    query = re.sub(r"^(?:请|帮我|麻烦|能不能|可以)?\s*(?:搜搜|搜一下|搜索一下|搜索|联网查|查一下|查查)\s*", "", text.strip())
+    query = re.sub(r"\s+", " ", query).strip()
+    return (query or text.strip())[:240]
+
+
+def start_tool_event(assistant: dict, emit, name: str, query: str) -> int:
+    events = assistant.setdefault("tool_events", [])
+    event = {"name": name, "query": query, "status": "searching"}
+    events.append(event)
+    index = len(events) - 1
+    emit("tool_event", {"index": index, "event": dict(event)})
+    return index
+
+
+def finish_tool_event(assistant: dict, emit, index: int, result_count: int = 0, error: str = "") -> None:
+    events = assistant.get("tool_events") or []
+    if index < 0 or index >= len(events):
+        return
+    event = events[index]
+    event["status"] = "error" if error else "done"
+    event["result_count"] = result_count
+    if error:
+        event["error"] = error[:300]
+    emit("tool_event", {"index": index, "event": dict(event)})
+
+
+def should_force_web_search(user_text: str, model_text: str) -> bool:
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    if any(hint in text for hint in WEB_SEARCH_HINTS):
+        return True
+    short_model = (model_text or "").strip()
+    return len(short_model) < 120 and any(word in short_model for word in ("查一下", "搜索一下", "帮你查", "我来搜"))
+
+
+def run_tool_loop(
+    provider: dict,
+    model_id: str,
+    messages: list[dict],
+    effort: str,
+    tools: list[dict] | None,
+    web_enabled: bool,
+    web_api_key: str,
+    web_max_results: int,
+    emit,
+    assistant: dict,
+) -> None:
+    active = list(messages)
+    active_tools = tools
+    disabled_notice_sent = False
+    for round_index in range(TOOL_MAX_ROUNDS + 1):
+        pending: list[dict] = []
+        round_content: list[str] = []
+        round_reasoning: list[str] = []
+        events = stream_chat(provider, model_id, active, effort, tools=active_tools)
+        try:
+            for event_type, data in events:
+                if event_type == "notice":
+                    emit("notice", {"message": data.get("message", "已切换兼容模式")})
+                elif event_type == "status":
+                    assistant["status"] = str(data.get("message") or "")
+                    emit("status", {"message": assistant["status"]})
+                elif event_type == "reasoning":
+                    text = str(data.get("text") or "")
+                    round_reasoning.append(text)
+                    assistant["reasoning"] += text
+                    assistant["status"] = ""
+                    emit("reasoning", {"text": text})
+                elif event_type == "content":
+                    text = str(data.get("text") or "")
+                    round_content.append(text)
+                    assistant["content"] += text
+                    assistant["status"] = ""
+                    emit("content", {"text": text})
+                elif event_type == "usage":
+                    assistant["usage"] = data.get("usage")
+                    emit("usage", {"usage": data.get("usage")})
+                elif event_type == "tool_calls":
+                    calls = data.get("tool_calls")
+                    if isinstance(calls, list):
+                        pending.extend(calls)
+                elif event_type == "finish" and data.get("finish_reason"):
+                    assistant["finish_reason"] = data.get("finish_reason")
+        finally:
+            events.close()
+
+        if not pending:
+            round_text = "".join(round_content)
+            tool_markup = contains_tool_markup(round_text)
+            if tool_markup:
+                assistant["content"] = ""
+                emit("replace_content", {"content": ""})
+                if not web_enabled:
+                    if disabled_notice_sent:
+                        return
+                    active.append({
+                        "role": "system",
+                        "content": "模型刚才试图调用 web_search，但用户当前关闭了联网搜索。请用简体中文直接告诉用户：需要点击输入框中的地球按钮开启联网搜索，然后才能查询实时或网络信息。不要输出 DSML、XML 或工具调用代码，也不要假装已经完成搜索。",
+                    })
+                    active_tools = None
+                    disabled_notice_sent = True
+                    continue
+            if round_index == 0 and web_enabled and not assistant.get("search_sources"):
+                user_text = ""
+                for message in reversed(active):
+                    if message.get("role") == "user":
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            user_text = content
+                        elif isinstance(content, list):
+                            user_text = " ".join(
+                                str(part.get("text") or "")
+                                for part in content
+                                if isinstance(part, dict) and part.get("type") == "text"
+                            )
+                        break
+                if tool_markup or should_force_web_search(user_text, round_text):
+                    query = clean_search_query(user_text)
+                    tool_index = start_tool_event(assistant, emit, "web_search", query)
+                    assistant["status"] = f"正在联网搜索：{query}"
+                    emit("status", {"message": assistant["status"]})
+                    try:
+                        search_results = firecrawl_search(web_api_key, query, web_max_results)
+                    except UpstreamError as exc:
+                        finish_tool_event(assistant, emit, tool_index, 0, f"搜索失败：{exc.message}")
+                        emit("notice", {"message": f"搜索失败：{exc.message}"})
+                        return
+                    finish_tool_event(assistant, emit, tool_index, len(search_results))
+                    result_text = format_web_results(search_results)
+                    assistant["search_sources"] = [
+                        {"title": item["title"], "url": item["url"]}
+                        for item in search_results
+                    ]
+                    active.append({
+                        "role": "system",
+                        "content": "【本轮联网搜索结果，请基于这些结果回答用户问题，并在使用处附来源链接】\n" + result_text,
+                    })
+                    active_tools = None
+                    assistant["status"] = "正在整理搜索结果"
+                    emit("status", {"message": assistant["status"]})
+                    continue
+            return
+        if not web_enabled:
+            calls = normalize_tool_calls(pending)
+            active.append({
+                "role": "assistant",
+                "content": "".join(round_content) or None,
+                "tool_calls": [
+                    {"id": item["id"], "type": "function", "function": item["function"]}
+                    for item in calls
+                ],
+            })
+            for item in calls:
+                query = str(item["_args"].get("query") or "").strip()
+                index = start_tool_event(assistant, emit, item["function"]["name"], query)
+                finish_tool_event(assistant, emit, index, 0, "联网搜索未开启")
+                active.append({
+                    "role": "tool",
+                    "tool_call_id": item["id"],
+                    "content": json.dumps({
+                        "error": "web_search_disabled",
+                        "message": "用户当前关闭了联网搜索。不要重试。请用简体中文直接告诉用户：需要点击输入框中的地球按钮开启联网搜索，然后才能查询实时或网络信息。",
+                    }, ensure_ascii=False),
+                })
+            active_tools = None
+            continue
+        if round_index >= TOOL_MAX_ROUNDS:
+            raise UpstreamError("工具调用次数超过限制，已停止本次回答")
+
+        calls = normalize_tool_calls(pending)
+        tool_message = {
+            "role": "assistant",
+            "content": "".join(round_content) or None,
+            "tool_calls": [
+                {"id": item["id"], "type": "function", "function": item["function"]}
+                for item in calls
+            ],
+        }
+        active.append(tool_message)
+
+        for item in calls:
+            name = item["function"]["name"]
+            query = str(item["_args"].get("query") or "").strip()
+            tool_index = None
+            if name == "web_search":
+                tool_index = start_tool_event(assistant, emit, name, query)
+                if query:
+                    assistant["status"] = f"正在联网搜索：{query}"
+                    emit("status", {"message": assistant["status"]})
+            text, sources = execute_web_tool(item, web_api_key, web_max_results)
+            error_text = ""
+            if sources:
+                known = assistant.setdefault("search_sources", [])
+                for source in sources:
+                    if source not in known:
+                        known.append(source)
+            elif text.startswith("搜索失败"):
+                error_text = text
+                emit("notice", {"message": text})
+            if tool_index is not None:
+                finish_tool_event(assistant, emit, tool_index, len(sources), error_text)
+            active.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item["id"],
+                    "content": text,
+                }
+            )
+        assistant["status"] = "正在整理搜索结果"
+        emit("status", {"message": assistant["status"]})
+
+
+def stream_chat(
+    provider: dict,
+    model: str,
+    messages: list[dict],
+    effort: str,
+    tools: list[dict] | None = None,
+):
     """生成 (event, data) 事件。网络抖动或中转站响应慢时按配置自动重试。"""
-    full_payload = build_chat_payload(model, messages, effort)
+    full_payload = build_chat_payload(model, messages, effort, tools=tools)
     variants: list[tuple[dict, str | None]] = [(full_payload, None)]
+    if tools:
+        no_tools = dict(full_payload)
+        no_tools.pop("tools", None)
+        no_tools.pop("tool_choice", None)
+        variants.append((no_tools, "Provider does not support tools; continuing without tool calls."))
     if "stream_options" in full_payload:
         no_usage = dict(full_payload)
         no_usage.pop("stream_options", None)
@@ -1346,6 +1795,9 @@ def stream_chat(provider: dict, model: str, messages: list[dict], effort: str):
                         yield "reasoning", {"text": str(reasoning)}
                     if content:
                         yield "content", {"text": str(content)}
+                    tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+                    if isinstance(tool_calls, list) and tool_calls:
+                        yield "tool_calls", {"tool_calls": tool_calls}
                     usage = normalize_usage(obj.get("usage"))
                     if usage:
                         yield "usage", {"usage": usage}
@@ -1354,6 +1806,7 @@ def stream_chat(provider: dict, model: str, messages: list[dict], effort: str):
 
                 finish_reason = ""
                 last_usage = None
+                stream_tool_calls: dict[int, dict] = {}
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or line.startswith(":"):
@@ -1395,7 +1848,36 @@ def stream_chat(provider: dict, model: str, messages: list[dict], effort: str):
                     if content:
                         started = True
                         yield "content", {"text": str(content)}
+                    raw_tool_calls = source.get("tool_calls")
+                    if isinstance(raw_tool_calls, list):
+                        for position, raw_call in enumerate(raw_tool_calls):
+                            if not isinstance(raw_call, dict):
+                                continue
+                            try:
+                                call_index = int(raw_call.get("index", position))
+                            except (TypeError, ValueError):
+                                call_index = position
+                            current = stream_tool_calls.setdefault(
+                                call_index,
+                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                            )
+                            if raw_call.get("id"):
+                                current["id"] = str(raw_call["id"])
+                            function = raw_call.get("function") or {}
+                            if isinstance(function, dict):
+                                if function.get("name") and not current["function"]["name"]:
+                                    current["function"]["name"] = str(function["name"])
+                                args = function.get("arguments")
+                                if args:
+                                    current["function"]["arguments"] += (
+                                        args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+                                    )
+                            started = True
 
+                if stream_tool_calls:
+                    yield "tool_calls", {
+                        "tool_calls": [stream_tool_calls[key] for key in sorted(stream_tool_calls)]
+                    }
                 if last_usage:
                     yield "usage", {"usage": last_usage}
                 yield "finish", {"finish_reason": finish_reason}
@@ -1798,6 +2280,19 @@ a:hover { text-decoration: underline; }
 .msg-action:hover { color: var(--text-soft); background: rgba(255,255,255,.05); }
 .error-box { margin: 8px 0; padding: 10px 12px; border: 1px solid rgba(255,107,125,.2); border-radius: 9px; background: var(--danger-bg); color: #ffb6bf; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .notice-line { margin: 5px 0 9px; color: var(--warning); font-size: 10.5px; opacity: .84; }
+.search-sources { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 3px; }
+.search-sources a { max-width: 320px; overflow: hidden; padding: 3px 8px; border: 1px solid rgba(120,169,255,.16); border-radius: 999px; background: rgba(120,169,255,.05); color: var(--muted); font-size: 9.5px; text-decoration: none; white-space: nowrap; text-overflow: ellipsis; }
+.search-sources a:hover { color: var(--accent); border-color: rgba(120,169,255,.38); text-decoration: none; }
+.tool-events { display: flex; flex-direction: column; gap: 5px; margin: 4px 0 9px; }
+.tool-events.hidden { display: none; }
+.tool-event { display: flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid rgba(120,169,255,.16); border-radius: 8px; background: rgba(120,169,255,.04); color: var(--muted); font-size: 10px; line-height: 1.4; }
+.tool-event svg { flex: 0 0 12px; width: 12px; height: 12px; color: var(--accent); }
+.tool-event-name { flex: 0 0 auto; color: var(--text-soft); font-weight: 600; }
+.tool-event-query { min-width: 0; overflow: hidden; color: var(--muted); white-space: nowrap; text-overflow: ellipsis; }
+.tool-event-status { margin-left: auto; flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 8.5px; }
+.tool-event.searching .tool-event-status { color: var(--accent); }
+.tool-event.error { border-color: rgba(255,100,118,.25); background: rgba(255,100,118,.05); }
+.tool-event.error .tool-event-status { color: var(--danger); }
 
 /* ---------- composer ---------- */
 .composer-wrap { position: relative; flex: 0 0 auto; padding: 2px 28px 10px; background: linear-gradient(to top, var(--bg) 56%, rgba(9,11,13,0)); }
@@ -1810,6 +2305,22 @@ a:hover { text-decoration: underline; }
 .attach-btn { flex: 0 0 30px; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.02); color: var(--faint); transition: .15s ease; }
 .attach-btn:hover:not(:disabled) { color: var(--text-soft); border-color: var(--line-strong); background: rgba(255,255,255,.05); }
 .attach-btn svg { width: 15px; height: 15px; }
+.attach-btn.active { color: #0b1524; border-color: rgba(120,169,255,.6); background: var(--accent); }
+.attach-btn.active svg { color: #0b1524; }
+.settings-card { padding: 18px; border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(150deg, rgba(255,255,255,.03), rgba(255,255,255,.012)); }
+.settings-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 4px 0 14px; }
+.settings-row strong { display: block; color: var(--text); font-size: 13px; font-weight: 600; }
+.settings-row > div > span { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.switch { position: relative; flex: 0 0 42px; width: 42px; height: 24px; margin-top: 1px; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch span { position: absolute; inset: 0; border: 1px solid var(--line-strong); border-radius: 999px; background: rgba(255,255,255,.05); transition: .18s ease; }
+.switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #8d98a8; transition: .18s ease; }
+.switch input:checked + span { background: rgba(120,169,255,.22); border-color: rgba(120,169,255,.5); }
+.switch input:checked + span::after { transform: translateX(18px); background: var(--accent); }
+.settings-hint { margin: 6px 0 14px; color: var(--faint); font-size: 10.5px; line-height: 1.7; }
+.settings-card .field { margin-top: 14px; }
+.attach-btn.active { color: #0b1524; border-color: rgba(120,169,255,.6); background: var(--accent); }
+.attach-btn.active svg { color: #0b1524; }
 .attachment-strip { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 2px 10px; }
 .attachment-item { position: relative; width: 62px; height: 62px; border: 1px solid var(--line-strong); border-radius: 10px; overflow: hidden; background: #0a0d10; }
 .attachment-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -2116,6 +2627,8 @@ a:hover { text-decoration: underline; }
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13.2 2 5 13h5.6L9.8 22 19 10.5h-5.9L13.2 2Z" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linejoin="round"/></symbol>
   <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8.5" cy="9.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m4.5 17 5.2-5.2 3.4 3.4 2.4-2.4 4 4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M4 12h16M12 3.8c2.1 2.3 3.1 5.1 3.1 8.2s-1 5.9-3.1 8.2c-2.1-2.3-3.1-5.1-3.1-8.2S9.9 6.1 12 3.8Z" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M4 12h16M12 3.8c2.1 2.3 3.1 5.1 3.1 8.2s-1 5.9-3.1 8.2c-2.1-2.3-3.1-5.1-3.1-8.2S9.9 6.1 12 3.8Z" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6V3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 3v4h4M9 12h6M9 16h6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.4 6.7M20 4.5V11h-6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-archive" viewBox="0 0 24 24"><path d="M4 7.5h16V19a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19V7.5ZM3 4.5h18v3H3v-3ZM9.5 11.5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
@@ -2199,6 +2712,7 @@ a:hover { text-decoration: underline; }
             <div class="composer-tools">
               <button class="attach-btn" id="fileBtn" type="button" aria-label="添加文件" title="添加 PDF / Word / 文本文件"><svg><use href="#i-file"></use></svg></button>
               <button class="attach-btn" id="attachBtn" type="button" aria-label="添加图片" title="添加图片（需模型支持视觉）"><svg><use href="#i-image"></use></svg></button>
+              <button class="attach-btn" id="webSearchBtn" type="button" aria-label="联网搜索" title="联网搜索（需先配置 Firecrawl）"><svg><use href="#i-globe"></use></svg></button>
               <div class="composer-hint" id="composerHint"><kbd>Enter</kbd> 发送 <span class="sep">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</div>
             </div>
             <div class="context-bar hidden" id="contextBar">
@@ -2219,7 +2733,8 @@ a:hover { text-decoration: underline; }
       <div class="settings-scroll">
         <div class="settings-tabs" id="settingsTabs">
           <button class="settings-tab active" type="button" data-settings-tab="models">模型配置</button>
-          <button class="settings-tab" type="button" data-settings-tab="prompts">SYSTEM PROMPTS</button>
+          <button class="settings-tab" type="button" data-settings-tab="prompts">系统提示词</button>
+          <button class="settings-tab" type="button" data-settings-tab="web">联网搜索</button>
           <button class="settings-tab" type="button" data-settings-tab="archive">归档 <span class="tab-count" id="archiveCount">0</span></button>
         </div>
         <div id="modelSettingsPanel">
@@ -2255,6 +2770,25 @@ a:hover { text-decoration: underline; }
             </button>
           </div>
           <div class="prompt-list" id="promptList"></div>
+        </div>
+        <div id="webSettingsPanel" class="hidden">
+          <div class="settings-heading">
+            <div>
+              <div class="eyebrow">WEB SEARCH</div>
+              <h1>联网搜索</h1>
+              <p>使用 Firecrawl 搜索网页并读取正文。只有输入框的联网按钮开启且模型判断需要时才会搜索。</p>
+            </div>
+          </div>
+          <section class="settings-card">
+            <div class="settings-row">
+              <div><strong>启用联网搜索</strong><span>关闭后输入框按钮不可用，也不会向模型发送搜索工具。</span></div>
+              <label class="switch"><input type="checkbox" id="webEnabledToggle"><span></span></label>
+            </div>
+            <label class="field"><span>Firecrawl API Key</span><input class="input" id="firecrawlKey" type="password" autocomplete="off" placeholder="fc-..."></label>
+            <div class="settings-hint" id="firecrawlKeyHint"></div>
+            <label class="field"><span>每次搜索结果数</span><input class="input" id="webMaxResults" type="number" min="1" max="5" value="5"></label>
+            <div style="margin-top:16px"><button class="primary-btn" id="saveWebSettingsBtn" type="button">保存搜索设置</button></div>
+          </section>
         </div>
         <div id="archiveSettingsPanel" class="hidden">
           <div class="settings-heading">
@@ -2302,6 +2836,8 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     prompts: [],
     activePromptId: "",
     promptSelection: "",
+    webSettings: { enabled: false, configured: false, key_hint: "", max_results: 5 },
+    webSearchEnabled: false,
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -2374,6 +2910,13 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     imageInput: $("#imageInput"),
     fileBtn: $("#fileBtn"),
     fileInput: $("#fileInput"),
+    webSearchBtn: $("#webSearchBtn"),
+    webSettingsPanel: $("#webSettingsPanel"),
+    webEnabledToggle: $("#webEnabledToggle"),
+    firecrawlKey: $("#firecrawlKey"),
+    firecrawlKeyHint: $("#firecrawlKeyHint"),
+    webMaxResults: $("#webMaxResults"),
+    saveWebSettingsBtn: $("#saveWebSettingsBtn"),
     attachmentStrip: $("#attachmentStrip"),
     addProviderBtn: $("#addProviderBtn"),
     providerGrid: $("#providerGrid"),
@@ -2686,6 +3229,94 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       `<option value="${escapeHtml(prompt.id)}"${prompt.id === state.promptSelection ? " selected" : ""}>${escapeHtml(prompt.name)}</option>`
     )).join("");
     el.promptPicker.disabled = !visible || !state.prompts.length;
+  }
+
+  async function loadWebSettings(options = {}) {
+    try {
+      const data = await api("/api/settings");
+      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 5, ...(data.web || {}) };
+      const savedWeb = store.get("xxh.webSearch", "");
+      if (!state.webSettings.enabled || !state.webSettings.configured) {
+        state.webSearchEnabled = false;
+        store.set("xxh.webSearch", "0");
+      } else {
+        state.webSearchEnabled = savedWeb === "1";
+      }
+      renderWebSettings();
+      return state.webSettings;
+    } catch (error) {
+      if (!options.silent) toast(error.message, "error");
+      return state.webSettings;
+    }
+  }
+
+  function renderWebSettings() {
+    if (!el.webEnabledToggle) return;
+    el.webEnabledToggle.checked = Boolean(state.webSettings.enabled);
+    el.firecrawlKey.value = "";
+    el.firecrawlKey.placeholder = state.webSettings.configured
+      ? "已保存 " + (state.webSettings.key_hint || "Key") + "，留空则不修改"
+      : "fc-...";
+    el.firecrawlKeyHint.textContent = state.webSettings.configured
+      ? "已保存本地 Key，只写入 config.json，不会发送给模型。"
+      : "请填写 Firecrawl API Key 后再启用联网搜索。";
+    el.webMaxResults.value = String(state.webSettings.max_results || 5);
+    updateWebSearchButton();
+  }
+
+  function updateWebSearchButton() {
+    if (!el.webSearchBtn) return;
+    const usable = Boolean(state.webSettings.enabled && state.webSettings.configured);
+    if (!usable) state.webSearchEnabled = false;
+    el.webSearchBtn.classList.toggle("active", state.webSearchEnabled);
+    el.webSearchBtn.setAttribute("aria-pressed", state.webSearchEnabled ? "true" : "false");
+    el.webSearchBtn.title = !state.webSettings.enabled
+      ? "联网搜索已在设置中关闭"
+      : !state.webSettings.configured
+        ? "请先在设置中填写 Firecrawl API Key"
+        : state.webSearchEnabled
+          ? "联网搜索已开启，再次点击关闭"
+          : "点击开启联网搜索（模型自主决定是否搜索）";
+  }
+
+  function toggleWebSearch() {
+    if (!state.webSettings.enabled || !state.webSettings.configured) {
+      toast("请先在设置中启用联网搜索并填写 Firecrawl API Key", "error");
+      setRoute("settings");
+      setSettingsTab("web");
+      return;
+    }
+    state.webSearchEnabled = !state.webSearchEnabled;
+    store.set("xxh.webSearch", state.webSearchEnabled ? "1" : "0");
+    updateWebSearchButton();
+    toast(state.webSearchEnabled ? "联网搜索已开启，模型会自行判断是否搜索" : "联网搜索已关闭");
+  }
+
+  async function saveWebSettings() {
+    const enabled = Boolean(el.webEnabledToggle.checked);
+    const apiKey = el.firecrawlKey.value.trim();
+    const maxResults = Number(el.webMaxResults.value) || 5;
+    el.saveWebSettingsBtn.disabled = true;
+    try {
+      const data = await api("/api/settings/web", {
+        method: "POST",
+        body: { enabled, api_key: apiKey, max_results: maxResults },
+      });
+      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 5, ...(data.web || {}) };
+      const savedWeb = store.get("xxh.webSearch", "");
+      if (!state.webSettings.enabled || !state.webSettings.configured) {
+        state.webSearchEnabled = false;
+        store.set("xxh.webSearch", "0");
+      } else {
+        state.webSearchEnabled = savedWeb === "1";
+      }
+      renderWebSettings();
+      toast("搜索设置已保存");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      el.saveWebSettingsBtn.disabled = false;
+    }
   }
 
   async function loadProviders(options = {}) {
@@ -3247,15 +3878,17 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   }
 
   function setSettingsTab(tab) {
-    const next = ["models", "prompts", "archive"].includes(tab) ? tab : "models";
+    const next = ["models", "prompts", "web", "archive"].includes(tab) ? tab : "models";
     state.settingsTab = next;
     $$("[data-settings-tab]", el.settingsTabs).forEach((button) => {
       button.classList.toggle("active", button.getAttribute("data-settings-tab") === next);
     });
     el.modelSettingsPanel.classList.toggle("hidden", next !== "models");
     el.promptSettingsPanel.classList.toggle("hidden", next !== "prompts");
+    el.webSettingsPanel.classList.toggle("hidden", next !== "web");
     el.archiveSettingsPanel.classList.toggle("hidden", next !== "archive");
     if (next === "prompts") loadPrompts();
+    if (next === "web") loadWebSettings();
     if (next === "archive") loadArchivedConversations({ silent: true });
   }
 
@@ -3956,6 +4589,19 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     return parts.map((part) => `<span>${escapeHtml(part)}</span>`).join('<span class="dot">•</span>');
   }
 
+  function renderToolEvents(events) {
+    if (!Array.isArray(events) || !events.length) return "";
+    return events.map((event) => {
+      const status = event.status === "searching"
+        ? "搜索中…"
+        : event.status === "error"
+          ? "搜索失败"
+          : `完成 · ${event.result_count || 0} 条`;
+      const cls = event.status === "error" ? " error" : event.status === "searching" ? " searching" : "";
+      return `<div class="tool-event${cls}">${icon("i-globe")}<span class="tool-event-name">联网搜索</span><span class="tool-event-query">${escapeHtml(event.query || "自动判断查询")}</span><span class="tool-event-status">${escapeHtml(status)}</span></div>`;
+    }).join("");
+  }
+
   function messageHtml(message, options = {}) {
     const uid = message.uid || (message.uid = nextUid());
     if (message.role === "user") {
@@ -3997,8 +4643,10 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
             <summary><span>思考过程</span><span class="reasoning-count">${reasoning ? ` · ${reasoning.length} 字` : ""}</span></summary>
             <div class="reasoning-text">${escapeHtml(reasoning)}</div>
           </details>
+          <div class="tool-events ${Array.isArray(message.tool_events) && message.tool_events.length ? "" : "hidden"}">${renderToolEvents(message.tool_events)}</div>
           <div class="thinking-indicator ${message.streaming && !content ? "" : "hidden"}"><span class="thinking-text">${escapeHtml(message.status || "正在思考")}</span><i></i><i></i><i></i></div>
           <div class="markdown ${message.streaming ? "streaming" : ""} ${content ? "" : "hidden"}">${content ? renderMarkdown(content) : ""}</div>
+          ${Array.isArray(message.search_sources) && message.search_sources.length ? `<div class="search-sources">${message.search_sources.map((source) => `<a href="${escapeHtml(source.url || "#")}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(source.title || source.url || "")}">${escapeHtml(source.title || source.url || "来源")}</a>`).join("")}</div>` : ""}
           ${message.notice ? `<div class="notice-line">${escapeHtml(message.notice)}</div>` : ""}
           ${message.stopped ? `<div class="notice-line">已停止生成</div>` : ""}
           ${message.error ? `<div class="error-box">${escapeHtml(message.error)}</div>` : ""}
@@ -4246,6 +4894,11 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
         message._reasoningOpened = true;
         message._reasoningAutoOpened = true;
       }
+    }
+    const toolBox = row.querySelector(".tool-events");
+    if (toolBox) {
+      toolBox.innerHTML = renderToolEvents(message.tool_events);
+      toolBox.classList.toggle("hidden", !Array.isArray(message.tool_events) || !message.tool_events.length);
     }
     const thinking = row.querySelector(".thinking-indicator");
     const thinkingText = row.querySelector(".thinking-text");
@@ -4577,6 +5230,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       }
     });
     el.attachBtn.addEventListener("click", () => el.imageInput.click());
+    el.webSearchBtn.addEventListener("click", toggleWebSearch);
     el.imageInput.addEventListener("change", async () => {
       await addImageFiles(el.imageInput.files);
       el.imageInput.value = "";
@@ -4754,6 +5408,15 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
           assistant.content += event.text || "";
           assistant.status = "";
           queueStreamRender(assistant);
+        } else if (event.type === "replace_content") {
+          assistant.content = event.content || "";
+          queueStreamRender(assistant);
+        } else if (event.type === "tool_event") {
+          if (event.event) {
+            assistant.tool_events = Array.isArray(assistant.tool_events) ? assistant.tool_events : [];
+            assistant.tool_events[Number(event.index) || 0] = event.event;
+          }
+          queueStreamRender(assistant);
         } else if (event.type === "usage") {
           if (event.usage) assistant.usage = event.usage;
         } else if (event.type === "error") {
@@ -4846,6 +5509,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       provider_id: provider.id,
       model: model.id,
       prompt_id: state.currentId ? "" : state.promptSelection,
+      web_search: Boolean(state.webSearchEnabled),
       reasoning_effort: effort,
       message: text,
       images,
@@ -5016,6 +5680,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     el.mobileBackdrop.addEventListener("click", closeMobileSidebar);
 
     el.addProviderBtn.addEventListener("click", () => openProviderModal());
+    el.saveWebSettingsBtn.addEventListener("click", saveWebSettings);
     el.addPromptBtn.addEventListener("click", () => openPromptModal());
     el.promptList.addEventListener("click", (event) => {
       const action = event.target.closest("[data-prompt-action]");
@@ -5201,11 +5866,12 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   }
 
   async function init() {
+    state.webSearchEnabled = store.get("xxh.webSearch", "") === "1";
     setRoute(window.location.hash === "#settings" ? "settings" : "chat", false);
     setupComposer();
     bindEvents();
     renderMessages();
-    await Promise.all([loadProviders(), loadPrompts()]);
+    await Promise.all([loadProviders(), loadPrompts(), loadWebSettings({ silent: true })]);
     await Promise.all([
       loadConversations(),
       loadArchivedConversations({ silent: true }),
@@ -5342,6 +6008,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "active_prompt_id": config.get("active_prompt_id"),
                     }
                 )
+                return
+            if path == "/api/settings":
+                config = load_config()
+                web = (config.get("settings") or {}).get("web") or {}
+                key = str(web.get("api_key") or "")
+                self._send_json({
+                    "web": {
+                        "enabled": bool(web.get("enabled")),
+                        "configured": bool(key),
+                        "key_hint": ("••••" + key[-4:]) if key else "",
+                        "max_results": int(web.get("max_results") or WEB_SEARCH_MAX_RESULTS),
+                    }
+                })
                 return
             if path == "/api/conversations":
                 query = parse_qs(urlparse(self.path).query)
@@ -5487,6 +6166,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if prompt_delete:
                 self._handle_delete_prompt(unquote(prompt_delete.group(1)))
                 return
+            if path == "/api/settings/web":
+                self._handle_save_web_settings(payload)
+                return
             if path == "/api/chat":
                 self._handle_chat(payload)
                 return
@@ -5524,6 +6206,39 @@ class HarnessHandler(BaseHTTPRequestHandler):
         name = unquote(self.headers.get("X-File-Name") or "file")
         result = extract_file_text(name, raw)
         self._send_json({"file": result})
+
+    def _handle_save_web_settings(self, payload: dict) -> None:
+        api_key = str(payload.get("api_key") or "").strip()
+        raw_enabled = payload.get("enabled")
+        enabled = raw_enabled is True or str(raw_enabled).lower() in ("1", "true", "yes")
+        try:
+            max_results = int(payload.get("max_results") or WEB_SEARCH_MAX_RESULTS)
+        except (TypeError, ValueError):
+            max_results = WEB_SEARCH_MAX_RESULTS
+        max_results = max(1, min(WEB_SEARCH_MAX_RESULTS, max_results))
+        with FILE_LOCK:
+            config = load_config()
+            web = ((config.get("settings") or {}).get("web") or {})
+            existing = str(web.get("api_key") or "")
+            if payload.get("clear_key"):
+                api_key = ""
+            elif not api_key:
+                api_key = existing
+            if enabled and not api_key:
+                raise ApiError("开启联网搜索前请先填写 Firecrawl API Key", 400)
+            web["enabled"] = enabled
+            web["api_key"] = api_key
+            web["max_results"] = max_results
+            config.setdefault("settings", {})["web"] = web
+            save_config(config)
+        self._send_json({
+            "web": {
+                "enabled": enabled,
+                "configured": bool(api_key),
+                "key_hint": ("••••" + api_key[-4:]) if api_key else "",
+                "max_results": max_results,
+            }
+        })
 
     def _handle_save_prompt(self, payload: dict) -> None:
         prompt_id = str(payload.get("id") or "").strip()
@@ -5747,6 +6462,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
         conversation_id = str(payload.get("conversation_id") or "").strip()
         requested_prompt_id = str(payload.get("prompt_id") or "").strip()
         requested_effort = str(payload.get("reasoning_effort") or "").strip()
+        raw_web_search = payload.get("web_search")
+        web_search_enabled = raw_web_search is True or str(raw_web_search).lower() in ("1", "true", "yes")
         raw_regenerate = payload.get("regenerate_turn_index")
         raw_edit = payload.get("edit_turn_index")
         is_regenerate = raw_regenerate is not None and str(raw_regenerate).strip() != ""
@@ -5773,6 +6490,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
         with FILE_LOCK:
             config = load_config()
+            app_settings = config.get("settings") or default_settings()
+            web_settings = app_settings.get("web") or {}
+            web_api_key = str(web_settings.get("api_key") or "").strip()
+            web_enabled = bool(web_search_enabled and web_settings.get("enabled"))
+            web_capable = bool(web_settings.get("enabled") and web_api_key)
+            if web_search_enabled and not web_settings.get("enabled"):
+                raise ApiError("联网搜索尚未在设置中开启", 400)
+            if web_search_enabled and not web_api_key:
+                raise ApiError("请先在设置中填写 Firecrawl API Key", 400)
             provider = provider_by_id(config, provider_id)
             model_info = find_model(provider, model_id)
             if not model_info:
@@ -5834,6 +6560,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 conv["prompt_id"] = conv.get("prompt_id") or prompt.get("id")
                 conv["prompt_name"] = conv.get("prompt_name") or prompt.get("name")
                 conv["system_prompt"] = prompt.get("content")
+
+            environment_text = str(conv.get("environment") or "")
+            if not environment_text or "运行环境" in environment_text:
+                conv["environment"] = build_environment_note()
 
             now = utc_now()
             conv["provider_id"] = provider_id
@@ -5900,30 +6630,22 @@ class HarnessHandler(BaseHTTPRequestHandler):
         }
         error_message: str | None = None
         client_gone = False
-        events = stream_chat(provider, model_id, upstream_messages, effort)
+        tool_schema = [web_search_tool_schema()] if web_capable else None
+        active_messages = list(upstream_messages)
+        tool_round = 0
         try:
-            for event_type, data in events:
-                if event_type == "notice":
-                    self._emit_sse("notice", {"message": data.get("message", "已切换兼容模式")})
-                elif event_type == "status":
-                    assistant["status"] = str(data.get("message") or "")
-                    self._emit_sse("status", {"message": assistant["status"]})
-                elif event_type == "reasoning":
-                    text = str(data.get("text") or "")
-                    assistant["reasoning"] += text
-                    assistant["status"] = ""
-                    self._emit_sse("reasoning", {"text": text})
-                elif event_type == "content":
-                    text = str(data.get("text") or "")
-                    assistant["content"] += text
-                    assistant["status"] = ""
-                    self._emit_sse("content", {"text": text})
-                elif event_type == "usage":
-                    assistant["usage"] = data.get("usage")
-                    self._emit_sse("usage", {"usage": data.get("usage")})
-                elif event_type == "finish":
-                    if data.get("finish_reason"):
-                        assistant["finish_reason"] = data.get("finish_reason")
+            run_tool_loop(
+                provider=provider,
+                model_id=model_id,
+                messages=active_messages,
+                effort=effort,
+                tools=tool_schema,
+                web_enabled=web_enabled,
+                web_api_key=web_api_key,
+                web_max_results=int(web_settings.get("max_results") or WEB_SEARCH_MAX_RESULTS),
+                emit=self._emit_sse,
+                assistant=assistant,
+            )
         except ClientDisconnected:
             client_gone = True
         except UpstreamError as exc:
@@ -5931,30 +6653,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
             self.log_message("upstream error: %s", exc.message)
             if is_context_error(exc.message, exc.detail):
                 assistant["context_overflow"] = True
-                error_message = (
-                    "上下文超出模型可接收的长度，本次请求未完成。"
-                    "请压缩上下文，或新建一个对话继续。"
-                )
-                exc.message = error_message
+                error_message = "上下文超出模型可接收的长度，本次请求未完成。请压缩上下文，或新建一个对话继续。"
             try:
-                self._emit_sse(
-                    "error",
-                    {
-                        "message": error_message,
-                        "context_overflow": bool(assistant.get("context_overflow")),
-                    },
-                )
+                self._emit_sse("error", {"message": error_message, "context_overflow": bool(assistant.get("context_overflow"))})
             except ClientDisconnected:
                 client_gone = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             error_message = f"对话中断：{exc}"
             self.log_message("chat error: %s", exc)
             try:
                 self._emit_sse("error", {"message": error_message})
             except ClientDisconnected:
                 client_gone = True
-        finally:
-            events.close()
 
         if client_gone and not assistant.get("finish_reason"):
             assistant["stopped"] = True

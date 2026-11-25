@@ -10,9 +10,8 @@
 
 - 当前程序版本：1.2.0
 - 历史版本：通过 Git 提交历史查看 1.0 和 1.1
-- 许可证：MIT License
 
-仓库根目录始终是当前版本，不再放置旧版目录。历史提交仅保留当时的程序源码、启动脚本和配置模板；个人配置、API Key、对话记录、索引、缓存和长期记忆均不进入仓库。
+仓库根目录始终是当前版本，不再放置旧版目录。历史提交保留当时的程序源码和启动脚本；个人配置、API Key、对话记录、索引、缓存和长期记忆均不进入仓库。
 
 ---
 
@@ -75,9 +74,9 @@ http://127.0.0.1:8765
 
 ### 从 Git 仓库获取后首次运行
 
-仓库只应包含源码、说明、启动脚本和 `config.example.json`，不应包含个人运行数据。首次运行时缺少 `config.json`、`conversations.json` 和 `memory.json` 不影响启动；程序会使用空供应商列表和内置提示词。
+仓库只包含 `app.py`、`README.md` 和 `启动.bat`，不包含个人运行数据。首次运行时缺少 `config.json`、`conversations.json` 和 `memory.json` 不影响启动；程序会使用空供应商列表和内置提示词。
 
-启动后进入设置页添加供应商、模型和 API Key。保存时只会在本机生成 `config.json`，该文件已被 `.gitignore` 排除。`config.example.json` 仅用于展示配置结构，不要把自己的真实 Key 填入其中。
+启动后进入设置页添加供应商、模型和 API Key。保存时只会在本机生成 `config.json`。配置、对话和记忆文件都只保留在本机，不应提交到仓库。
 
 ### 修改后刷新
 
@@ -92,13 +91,12 @@ http://127.0.0.1:8765
 小小肥鱼/
 ├─ app.py                 # 唯一程序文件：后端 + HTML/CSS/JS
 ├─ 启动.bat               # Windows 启动脚本
-├─ config.example.json    # 不含密钥的配置模板
 ├─ README.md              # 本文档
-├─ config.json            # 本机运行数据，已被 Git 忽略
-├─ conversations.json     # 本机对话数据，已被 Git 忽略
-├─ conversation_index.json # 本机历史索引，已被 Git 忽略
-├─ conversation_cache/    # 本机会话缓存，已被 Git 忽略
-└─ memory.json            # 本机记忆数据，已被 Git 忽略
+├─ config.json            # 本机运行数据，不进入仓库
+├─ conversations.json     # 本机对话数据，不进入仓库
+├─ conversation_index.json # 本机历史索引，不进入仓库
+├─ conversation_cache/    # 本机会话缓存，不进入仓库
+└─ memory.json            # 本机记忆数据，不进入仓库
 ```
 
 ### 重要说明

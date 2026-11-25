@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import hashlib
 import json
 import os
 import re
@@ -39,19 +40,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 CONVERSATIONS_PATH = APP_DIR / "conversations.json"
-VERSION = "1.0.0"
+CONVERSATION_INDEX_PATH = APP_DIR / "conversation_index.json"
+CONVERSATION_CACHE_DIR = APP_DIR / "conversation_cache"
+VERSION = "1.2.0"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 24 * 1024 * 1024
-MAX_IMAGES = 4
 MAX_IMAGE_DATA_URL = 6_000_000
-MAX_FILES = 4
 MAX_FILE_BYTES = 25 * 1024 * 1024
-MAX_FILE_TEXT = 60_000
-MAX_TOTAL_FILE_TEXT = 120_000
-MAX_FILE_PAGE_IMAGES = 6
-MAX_TOTAL_PAGE_IMAGES = 8
-MAX_TOTAL_PAGE_IMAGE_DATA = 10_000_000
 MAX_PDF_PAGES = 100
 FILE_LOCK = threading.RLock()
 
@@ -84,6 +80,12 @@ DEFAULT_PROMPTS = [
         "content": TEACHING_PROMPT,
         "builtin": True,
     },
+    {
+        "id": "p_blank",
+        "name": "空白",
+        "content": "",
+        "builtin": True,
+    },
 ]
 DEFAULT_PROMPT_ID = DEFAULT_PROMPTS[0]["id"]
 MAX_PROMPT_CHARS = 30_000
@@ -107,7 +109,8 @@ COMPRESS_SYSTEM_PROMPT = (
 )
 
 FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
-WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_MAX_RESULTS = 50
+WEB_SEARCH_DEFAULT_RESULTS = 10
 WEB_RESULT_MARKDOWN_CHARS = 12_000
 WEB_TOTAL_CONTEXT_CHARS = 36_000
 TOOL_MAX_ROUNDS = 3
@@ -115,13 +118,15 @@ DEFAULT_TOOL_INSTRUCTIONS = (
     "你可以使用工具获取外部信息。只有当问题需要实时、网络上才有的信息，或用户明确要求搜索时，才调用 web_search。"
     "普通问答、写作、代码和数学推导不要搜索。调用工具前不要让用户确认，直接使用；需要搜索时必须在本轮立即调用 web_search，不要只回复“我来查一下”然后结束。不要编造工具结果。"
     "回答时如果使用了搜索结果，必须在相关陈述后附 Markdown 链接来源。"
+    "如果提供了 memory_search/memory_read_conversation/memory_save 工具：需要历史细节时先搜索索引，再读取指定对话；"
+    "只有明确、长期有价值且有原文依据的信息才调用 memory_save。不要保存密钥、密码、令牌，也不要把一次性请求写成长期偏好。"
 )
 
 
 def default_settings() -> dict:
     return {
-        "memory": {"enabled": False},
-        "web": {"enabled": False, "api_key": "", "max_results": WEB_SEARCH_MAX_RESULTS},
+        "memory": {"enabled": False, "provider_id": "", "model_id": "", "review_prompt": ""},
+        "web": {"enabled": False, "api_key": "", "max_results": WEB_SEARCH_DEFAULT_RESULTS},
     }
 
 CONTEXT_ERROR_MARKERS = (
@@ -214,7 +219,7 @@ def _normalize_prompts(raw) -> list[dict]:
                 continue
             name = str(item.get("name") or "").strip()
             content = str(item.get("content") or "").strip()
-            if not name or not content:
+            if not name:
                 continue
             prompt_id = str(item.get("id") or "").strip()
             if not prompt_id or prompt_id in seen_ids:
@@ -230,6 +235,13 @@ def _normalize_prompts(raw) -> list[dict]:
             )
     if not prompts:
         prompts = [dict(item) for item in DEFAULT_PROMPTS]
+    if not any(str(item.get("id")) == "p_blank" for item in prompts):
+        prompts.append({
+            "id": "p_blank",
+            "name": "空白",
+            "content": "",
+            "builtin": True,
+        })
     return prompts
 
 
@@ -285,6 +297,7 @@ def load_conversations() -> list[dict]:
 
 def save_conversations(conversations: list[dict]) -> None:
     _atomic_write_json(CONVERSATIONS_PATH, conversations)
+    _refresh_conversation_sidecars(conversations)
 
 
 def normalize_base_url(value: str) -> str:
@@ -566,8 +579,6 @@ def normalize_images(raw) -> list[str]:
         return []
     if not isinstance(raw, list):
         raise ApiError("图片参数格式错误")
-    if len(raw) > MAX_IMAGES:
-        raise ApiError(f"最多发送 {MAX_IMAGES} 张图片")
     images: list[str] = []
     for item in raw:
         value = item.get("data_url") if isinstance(item, dict) else item
@@ -590,10 +601,7 @@ def _decode_text_bytes(raw: bytes) -> str:
 
 def _normalize_extracted_text(text: str) -> tuple[str, bool]:
     cleaned = re.sub(r"\n{3,}", "\n\n", str(text)).strip()
-    truncated = len(cleaned) > MAX_FILE_TEXT
-    if truncated:
-        cleaned = cleaned[:MAX_FILE_TEXT].rstrip() + "\n\n[内容过长，已截断]"
-    return cleaned, truncated
+    return cleaned, False
 
 
 def _extract_docx_text(raw: bytes) -> str:
@@ -750,9 +758,6 @@ def _extract_pdf_content(raw: bytes) -> tuple[str, int, list[dict], bool, bool]:
                     xref = 0
                 if not xref or xref in seen_xrefs:
                     continue
-                if len(page_images) >= MAX_FILE_PAGE_IMAGES:
-                    images_truncated = True
-                    continue
                 image = _extract_pdf_image(doc, xref, fitz)
                 if image:
                     image["page"] = index + 1
@@ -767,21 +772,16 @@ def _extract_pdf_content(raw: bytes) -> tuple[str, int, list[dict], bool, bool]:
                 bool(page_text) and bool(significant) and not added_on_page
             )
             if needs_render:
-                if len(page_images) < MAX_FILE_PAGE_IMAGES:
-                    rendered = _render_pdf_page(page, fitz)
-                    if rendered:
-                        rendered["page"] = index + 1
-                        rendered["has_text"] = bool(page_text)
-                        rendered["fallback_render"] = True
-                        page_images.append(rendered)
-                        added_on_page = True
-                else:
-                    images_truncated = True
+                rendered = _render_pdf_page(page, fitz)
+                if rendered:
+                    rendered["page"] = index + 1
+                    rendered["has_text"] = bool(page_text)
+                    rendered["fallback_render"] = True
+                    page_images.append(rendered)
+                    added_on_page = True
 
             if not page_text and added_on_page:
                 text_parts.append(f"--- 第 {index + 1} 页（图片内容已附）---")
-            if total_text >= MAX_FILE_TEXT:
-                break
     finally:
         doc.close()
 
@@ -848,12 +848,7 @@ def normalize_files(raw) -> list[dict]:
         return []
     if not isinstance(raw, list):
         raise ApiError("文件参数格式错误")
-    if len(raw) > MAX_FILES:
-        raise ApiError(f"最多发送 {MAX_FILES} 个文件")
     files: list[dict] = []
-    total = 0
-    total_page_images = 0
-    total_page_image_chars = 0
     for item in raw:
         if not isinstance(item, dict):
             raise ApiError("文件参数格式错误")
@@ -862,9 +857,6 @@ def normalize_files(raw) -> list[dict]:
         if not isinstance(text, str) or not text.strip():
             raise ApiError(f"附件 {name} 没有可用的文字内容")
         text = text.strip()
-        total += len(text)
-        if total > MAX_TOTAL_FILE_TEXT:
-            raise ApiError(f"附件文字总量不能超过 {MAX_TOTAL_FILE_TEXT} 字，请减少文件或先精简")
         entry = {"name": name, "text": text, "chars": len(text)}
         if item.get("truncated"):
             entry["truncated"] = True
@@ -879,9 +871,6 @@ def normalize_files(raw) -> list[dict]:
         page_images: list[dict] = []
         if isinstance(raw_page_images, list):
             for image in raw_page_images:
-                if len(page_images) >= MAX_FILE_PAGE_IMAGES:
-                    entry["images_truncated"] = True
-                    break
                 if isinstance(image, str):
                     data_url = image
                     page_number = 0
@@ -898,9 +887,6 @@ def normalize_files(raw) -> list[dict]:
                 if len(data_url) > MAX_IMAGE_DATA_URL:
                     entry["images_truncated"] = True
                     continue
-                if total_page_image_chars + len(data_url) > MAX_TOTAL_PAGE_IMAGE_DATA:
-                    entry["images_truncated"] = True
-                    continue
                 page_image = {"data_url": data_url}
                 if page_number:
                     page_image["page"] = page_number
@@ -911,14 +897,8 @@ def normalize_files(raw) -> list[dict]:
                     except (TypeError, ValueError):
                         pass
                 page_images.append(page_image)
-        room = max(0, MAX_TOTAL_PAGE_IMAGES - total_page_images)
-        if len(page_images) > room:
-            page_images = page_images[:room]
-            entry["images_truncated"] = True
         if page_images:
             entry["page_images"] = page_images
-            total_page_images += len(page_images)
-            total_page_image_chars += sum(len(image["data_url"]) for image in page_images)
         if item.get("images_truncated"):
             entry["images_truncated"] = True
         files.append(entry)
@@ -961,6 +941,73 @@ def split_turns(messages: list[dict]) -> list[tuple[dict, list[dict]]]:
         if user["active_variant"] < 0:
             user["active_variant"] = 0
     return turns
+
+
+def clean_generated_title(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            text = str(obj.get("title") or obj.get("conversation_title") or "").strip()
+    except (json.JSONDecodeError, TypeError):
+        pass
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    title = lines[0]
+    title = re.sub(r"^(标题|对话标题)\s*[:：]\s*", "", title)
+    title = title.strip(" #*`'\"“”‘’《》")
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"[。.!！?？;；:：]+$", "", title).strip()
+    return make_title(title, 30)
+
+
+def generate_first_turn_title(config: dict, conv: dict) -> str:
+    settings = (config.get("settings") or {}).get("memory") or {}
+    provider_id = str(settings.get("provider_id") or "").strip()
+    model_id = str(settings.get("model_id") or "").strip()
+    if not provider_id or not model_id:
+        return ""
+    turns = split_turns(conv.get("messages") or [])
+    if len(turns) != 1:
+        return ""
+    user, assistants = turns[0]
+    assistant, _index = active_assistant(user, assistants)
+    if assistant is None or not str(assistant.get("content") or "").strip():
+        return ""
+    try:
+        provider = provider_by_id(config, provider_id)
+        if not find_model(provider, model_id):
+            return ""
+    except ApiError:
+        return ""
+    user_text = str(user.get("content") or "").strip()
+    extras = []
+    if user.get("images"):
+        extras.append("[用户附带了图片]")
+    for file in user.get("files") or []:
+        extras.append("[附件：" + str(file.get("name") or "未命名")[:80] + "]")
+    if extras:
+        user_text = (user_text + "\n" + "\n".join(extras)).strip()
+    answer_text = str(assistant.get("content") or "").strip()
+    prompt = f"【用户第一轮提问】\n{user_text[:6000]}\n\n【助手第一轮回答】\n{answer_text[:10000]}"
+    messages = [
+        {"role": "system", "content": AUTO_TITLE_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    chunks = []
+    try:
+        for event_type, data in stream_chat(provider, model_id, messages, ""):
+            if event_type == "content":
+                chunks.append(str(data.get("text") or ""))
+    except Exception:
+        return ""
+    return clean_generated_title("".join(chunks))
 
 
 def active_assistant(user: dict, assistants: list[dict]) -> tuple[dict | None, int]:
@@ -1079,6 +1126,196 @@ def public_conversation(conv: dict) -> dict:
     return result
 
 
+def _conversation_sidecar_paths() -> tuple[Path, Path]:
+    parent = CONVERSATIONS_PATH.parent.resolve()
+    if parent == APP_DIR.resolve():
+        return CONVERSATION_INDEX_PATH, CONVERSATION_CACHE_DIR
+    return parent / "conversation_index.json", parent / "conversation_cache"
+
+
+def _conversation_cache_path(conversation_id: str) -> Path:
+    _index_path, cache_dir = _conversation_sidecar_paths()
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(conversation_id or "conversation"))
+    return cache_dir / (safe + ".json")
+
+
+def _conversation_search_text(conv: dict) -> str:
+    parts = []
+    for message in conv.get("messages") or []:
+        content = str(message.get("content") or "").strip()
+        if content:
+            parts.append(content)
+        for file in message.get("files") or []:
+            if not isinstance(file, dict):
+                continue
+            name = str(file.get("name") or "").strip()
+            text = str(file.get("text") or "").strip()
+            if name:
+                parts.append(name)
+            if text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _conversation_index_record(conv: dict) -> dict:
+    summary = conversation_summary(conv, with_context=False)
+    summary["search_text"] = _conversation_search_text(conv)
+    summary["cache_file"] = _conversation_cache_path(str(conv.get("id") or "")).name
+    summary["fingerprint"] = hashlib.sha256(
+        json.dumps(conv, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return summary
+
+
+def _conversations_source_stamp() -> dict:
+    try:
+        stat = CONVERSATIONS_PATH.stat()
+        return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except OSError:
+        return {}
+
+
+def _refresh_conversation_sidecars(conversations: list[dict]) -> None:
+    index_path, cache_dir = _conversation_sidecar_paths()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    old_data = _read_json(index_path, {})
+    old_items = old_data.get("items") if isinstance(old_data, dict) and isinstance(old_data.get("items"), list) else []
+    old_by_id = {str(item.get("id") or ""): item for item in old_items if isinstance(item, dict)}
+    records = []
+    keep_files = set()
+    for conv in conversations:
+        record = _conversation_index_record(conv)
+        conv_id = str(record.get("id") or "")
+        cache_name = str(record.get("cache_file") or "")
+        cache_path = cache_dir / cache_name
+        old = old_by_id.get(conv_id) or {}
+        changed = (
+            not cache_path.exists()
+            or old.get("fingerprint") != record.get("fingerprint")
+        )
+        if changed:
+            _atomic_write_json(cache_path, conv)
+        keep_files.add(cache_name)
+        records.append(record)
+    for cache_path in cache_dir.glob("*.json"):
+        if cache_path.name not in keep_files:
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+    _atomic_write_json(index_path, {
+        "version": 1,
+        "source": _conversations_source_stamp(),
+        "items": records,
+    })
+
+
+def load_conversation_index() -> list[dict]:
+    index_path, _cache_dir = _conversation_sidecar_paths()
+    data = _read_json(index_path, {})
+    source = data.get("source") if isinstance(data, dict) else {}
+    if isinstance(data, dict) and isinstance(data.get("items"), list) and source == _conversations_source_stamp():
+        return data["items"]
+    conversations = load_conversations()
+    _refresh_conversation_sidecars(conversations)
+    refreshed = _read_json(index_path, {})
+    return refreshed.get("items", []) if isinstance(refreshed, dict) else []
+
+
+def load_conversation_by_id(conversation_id: str) -> dict | None:
+    wanted = str(conversation_id or "")
+    index_items = load_conversation_index()
+    record = next((item for item in index_items if str(item.get("id") or "") == wanted), None)
+    if record:
+        _index_path, cache_dir = _conversation_sidecar_paths()
+        cache_path = cache_dir / str(record.get("cache_file") or "")
+        if cache_path.exists():
+            data = _read_json(cache_path, None)
+            if isinstance(data, dict):
+                return data
+    conversations = load_conversations()
+    _refresh_conversation_sidecars(conversations)
+    conv = next((item for item in conversations if item.get("id") == wanted), None)
+    return conv
+
+
+def search_conversation_index(query: str, limit: int = 80) -> list[dict]:
+    needle = str(query or "").strip()
+    if not needle:
+        return []
+    needle_lower = needle.casefold()
+    results = []
+    for item in load_conversation_index():
+        title = str(item.get("title") or "对话")
+        match_type = ""
+        source = ""
+        if needle_lower in title.casefold():
+            match_type = "标题"
+            source = title
+        else:
+            search_text = str(item.get("search_text") or "")
+            if needle_lower in search_text.casefold():
+                match_type = "原文"
+                source = search_text
+        if not match_type:
+            continue
+        result = {key: value for key, value in item.items() if key not in ("search_text", "cache_file", "fingerprint")}
+        result["match_type"] = match_type
+        result["snippet"] = _search_snippet(source, needle)
+        results.append(result)
+    results.sort(key=lambda item: (1 if item.get("match_type") == "标题" else 0, item.get("updated_at") or ""), reverse=True)
+    return results[:max(1, min(200, int(limit or 80)))]
+
+
+def _search_snippet(text: str, query: str, radius: int = 80) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+    position = clean.casefold().find(query.casefold())
+    if position < 0:
+        return clean[:radius * 2] + ("…" if len(clean) > radius * 2 else "")
+    start = max(0, position - radius)
+    end = min(len(clean), position + len(query) + radius)
+    return ("…" if start else "") + clean[start:end] + ("…" if end < len(clean) else "")
+
+
+def search_conversations_text(conversations: list[dict], query: str, limit: int = 80) -> list[dict]:
+    needle = str(query or "").strip()
+    if not needle:
+        return []
+    needle_lower = needle.casefold()
+    results = []
+    for conv in conversations:
+        title = str(conv.get("title") or "对话")
+        best = None
+        if needle_lower in title.casefold():
+            best = {"match_type": "标题", "snippet": _search_snippet(title, needle)}
+        for message in conv.get("messages") or []:
+            content = str(message.get("content") or "")
+            candidates = [content]
+            for file in message.get("files") or []:
+                if isinstance(file, dict):
+                    candidates.append(str(file.get("name") or ""))
+                    candidates.append(str(file.get("text") or ""))
+            for candidate in candidates:
+                if needle_lower in candidate.casefold():
+                    best = {
+                        "match_type": "原文",
+                        "snippet": _search_snippet(candidate, needle),
+                    }
+                    break
+            if best and best.get("match_type") == "原文":
+                break
+        if best is None:
+            continue
+        summary = conversation_summary(conv, with_context=True)
+        summary.update(best)
+        results.append(summary)
+    results.sort(key=lambda item: (0 if item.get("match_type") == "标题" else 1, item.get("updated_at") or ""), reverse=False)
+    results.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return results[:max(1, min(200, int(limit or 80)))]
+
+
 def normalize_usage(raw: dict | None) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -1114,15 +1351,711 @@ def build_environment_note() -> str:
     return f"当前日期：{local:%Y-%m-%d}\n当前时间：{local:%H:%M}（{tz}）"
 
 
+MEMORY_PATH = APP_DIR / "memory.json"
+PROFILE_MAX_CHARS = 2500
+MEMORY_INDEX_SUMMARY_MAX_CHARS = 300
+MEMORY_NOTE_MAX_CHARS = 600
+MEMORY_NOTE_MAX_ITEMS = 20
+MEMORY_SAVE_MAX_CHARS = MEMORY_NOTE_MAX_CHARS * MEMORY_NOTE_MAX_ITEMS
+MEMORY_SNAPSHOT_MAX_CONVERSATIONS = 40
+MEMORY_SNAPSHOT_EDIT_MAX_CHARS = 50000
+MEMORY_SCAN_MINUTES = 30
+MEMORY_REVIEW_MAX_CONVERSATIONS = 20
+MEMORY_REVIEW_CONTEXT_CHARS = 48000
+MEMORY_SCAN_LOCK = threading.Lock()
+
+AUTO_TITLE_SYSTEM = (
+    "你是对话标题生成器。阅读用户的第一轮提问和助手回答，概括这次对话的具体主题。"
+    "生成一个简洁、可检索的中文标题，最多 20 个汉字。"
+    "只输出标题本身，不要引号、Markdown、序号、解释或结尾标点。"
+    "不要使用“关于”“对话”“问题”等空泛开头，也不要照抄整句问题。"
+)
+
+
+MEMORY_SUMMARY_COMPRESS_SYSTEM = (
+    "你是记忆索引摘要压缩器。把给定摘要压缩到 300 个中文字符以内。"
+    "保留主题、结论、关键事实和必要关键词，不添加新信息，不输出解释、标题或 Markdown。"
+    "只输出压缩后的摘要正文。"
+)
+
+
+MEMORY_REVIEW_SYSTEM = (
+    "你是长期记忆整理器。只根据提供的对话证据更新记忆，不能猜测用户性格、水平、身份或偏好。"
+    "只保存有明确依据、以后仍然有用的信息；一次性请求、临时任务状态和已完成工作的流水账不要写成长期偏好。"
+    "用户明确说“以后都这样/记住/别再”时才可升级为稳定偏好。后来的纠正要覆盖旧结论。"
+    "先判断整段对话是否值得长期记忆：寒暄、客套、单纯闲聊、一次性短问答、临时操作和以后不需要复用的内容都应标记为 false。"
+    "只有对话对以后仍有复用价值，或用户明确要求记住时才标记为 true。已有摘要本身有意义时，不能因为最近一轮闲聊就改成 false。"
+    "不得保存 API Key、密码、令牌、身份证号等敏感信息。"
+    "用户画像必须写成陈述句而非命令句，总长度不能超过 2500 个中文字符。"
+    "profile 必须是有条理的 Markdown，禁止写成一整段。固定使用以下二级标题分组："
+    "## 基本信息、## 偏好与习惯、## 学习与工作方式、## 当前长期目标、## 重要约束。"
+    "每个分类下每条信息单独一行并以 '- ' 开头；只保留有可靠证据且以后仍有用的内容。"
+    "没有内容的分类直接省略。合并旧画像时要去重、消除矛盾，不要写流水账，也不要把对话索引摘要塞进画像。"
+    "conversation_summary 必须压缩到 300 个中文字符以内，保留主题、结论和关键事实。"
+    "只输出一个 JSON 对象，不要 Markdown 代码围栏，格式为："
+    '{"worth_remembering":true,"profile":"完整的新用户画像","conversation_summary":"当前会话摘要","keywords":["关键词1","关键词2"]}'
+)
+
+
+def _clean_profile(value: str) -> str:
+    return str(value or "").strip()
+
+
+def _parse_iso_ts(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def load_memory() -> dict:
+    data = _read_json(MEMORY_PATH, {"version": 1, "profile": "", "conversations": []})
+    if not isinstance(data, dict):
+        data = {"version": 1, "profile": "", "conversations": []}
+    data["profile"] = _clean_profile(data.get("profile"))
+    raw_reviews = data.get("reviews") if isinstance(data.get("reviews"), dict) else {}
+    reviews = {}
+    for conv_id, state in raw_reviews.items():
+        if not isinstance(state, dict):
+            continue
+        key = str(conv_id or "")
+        if not key:
+            continue
+        try:
+            reviewed_count = max(0, int(state.get("reviewed_message_count") or 0))
+        except (TypeError, ValueError):
+            reviewed_count = 0
+        try:
+            failures = max(0, int(state.get("failures") or 0))
+        except (TypeError, ValueError):
+            failures = 0
+        reviews[key] = {
+            "reviewed_message_count": reviewed_count,
+            "reviewed_at": state.get("reviewed_at"),
+            "worth_remembering": bool(state.get("worth_remembering", True)),
+            "failures": failures,
+            "last_error": str(state.get("last_error") or "")[:500],
+            "last_failed_at": state.get("last_failed_at"),
+            "pending_message_count": int(state.get("pending_message_count") or 0),
+            "last_activity_at": state.get("last_activity_at"),
+        }
+    items = data.get("conversations")
+    if not isinstance(items, list):
+        items = []
+    seen = set()
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        conv_id = str(item.get("id") or "")
+        if not conv_id or conv_id in seen:
+            continue
+        seen.add(conv_id)
+        summary = str(item.get("summary") or "").strip()
+        keywords = [str(x)[:40] for x in (item.get("keywords") or []) if str(x).strip()][:10]
+        notes = [str(x).strip()[:MEMORY_NOTE_MAX_CHARS] for x in (item.get("notes") or []) if str(x).strip()][:MEMORY_NOTE_MAX_ITEMS]
+        worth_remembering = bool(item.get("worth_remembering", True))
+        legacy_count = int(item.get("last_memory_message_count") or 0)
+        review = reviews.setdefault(conv_id, {
+            "reviewed_message_count": 0,
+            "reviewed_at": None,
+            "worth_remembering": worth_remembering,
+            "failures": 0,
+            "last_error": "",
+            "last_failed_at": None,
+            "pending_message_count": 0,
+            "last_activity_at": item.get("last_activity_at"),
+        })
+        review["reviewed_message_count"] = max(int(review.get("reviewed_message_count") or 0), legacy_count)
+        if item.get("last_memory_at") and not review.get("reviewed_at"):
+            review["reviewed_at"] = item.get("last_memory_at")
+        if not worth_remembering:
+            review["worth_remembering"] = False
+            continue
+        if not (summary or keywords or notes):
+            continue
+        review["worth_remembering"] = True
+        normalized.append({
+            "id": conv_id,
+            "title": str(item.get("title") or "对话")[:120],
+            "summary": summary,
+            "keywords": keywords,
+            "notes": notes,
+            "turns": int(item.get("turns") or 0),
+            "archived": bool(item.get("archived")),
+            "worth_remembering": worth_remembering,
+            "updated_at": item.get("updated_at"),
+            "last_activity_at": item.get("last_activity_at"),
+            "last_memory_at": item.get("last_memory_at"),
+            "last_memory_message_count": legacy_count,
+        })
+    data["reviews"] = reviews
+    data["conversations"] = normalized
+    return data
+
+
+def save_memory(memory: dict) -> None:
+    memory["profile"] = _clean_profile(memory.get("profile"))
+    memory["updated_at"] = utc_now()
+    _atomic_write_json(MEMORY_PATH, memory)
+
+
+def _conversation_last_activity(conv: dict) -> str:
+    latest = ""
+    latest_ts = 0.0
+    for message in conv.get("messages") or []:
+        stamp = str(message.get("created_at") or "")
+        ts = _parse_iso_ts(stamp)
+        if stamp and ts >= latest_ts:
+            latest = stamp
+            latest_ts = ts
+    return latest or str(conv.get("updated_at") or "")
+
+
+def _memory_entry(memory: dict, conversation_id: str) -> dict | None:
+    for item in memory.get("conversations") or []:
+        if item.get("id") == conversation_id:
+            return item
+    return None
+
+
+def _review_state(memory: dict, conversation_id: str) -> dict:
+    reviews = memory.setdefault("reviews", {})
+    state = reviews.get(conversation_id)
+    if not isinstance(state, dict):
+        state = {}
+        reviews[conversation_id] = state
+    state.setdefault("reviewed_message_count", 0)
+    state.setdefault("reviewed_at", None)
+    state.setdefault("worth_remembering", True)
+    state.setdefault("failures", 0)
+    state.setdefault("last_error", "")
+    state.setdefault("last_failed_at", None)
+    state.setdefault("pending_message_count", 0)
+    return state
+
+
+def _mark_review_success(memory: dict, conv: dict, worth_remembering: bool) -> dict:
+    state = _review_state(memory, str(conv.get("id") or ""))
+    state["reviewed_message_count"] = len(conv.get("messages") or [])
+    state["reviewed_at"] = utc_now()
+    state["worth_remembering"] = bool(worth_remembering)
+    state["failures"] = 0
+    state["last_error"] = ""
+    state["last_failed_at"] = None
+    state["pending_message_count"] = 0
+    state["last_activity_at"] = _conversation_last_activity(conv)
+    return state
+
+
+def _mark_review_failure(memory: dict, conv: dict, error: str) -> dict:
+    state = _review_state(memory, str(conv.get("id") or ""))
+    state["failures"] = int(state.get("failures") or 0) + 1
+    state["last_error"] = str(error or "unknown error")[:500]
+    state["last_failed_at"] = utc_now()
+    state["pending_message_count"] = len(conv.get("messages") or [])
+    state["last_activity_at"] = _conversation_last_activity(conv)
+    return state
+
+
+def _remove_memory_entry(memory: dict, conversation_id: str) -> None:
+    memory["conversations"] = [
+        item for item in (memory.get("conversations") or [])
+        if str(item.get("id") or "") != conversation_id
+    ]
+
+
+def _entry_is_meaningful(entry: dict) -> bool:
+    if not isinstance(entry, dict) or entry.get("worth_remembering") is False:
+        return False
+    return bool(
+        str(entry.get("summary") or "").strip()
+        or [x for x in (entry.get("notes") or []) if str(x).strip()]
+        or [x for x in (entry.get("keywords") or []) if str(x).strip()]
+    )
+
+
+def _touch_memory_entry(memory: dict, conv: dict) -> dict | None:
+    entry = _memory_entry(memory, str(conv.get("id") or ""))
+    if entry is None:
+        return None
+    entry["title"] = str(conv.get("title") or "对话")[:120]
+    entry["turns"] = len(split_turns(conv.get("messages") or []))
+    entry["updated_at"] = utc_now()
+    entry["last_activity_at"] = _conversation_last_activity(conv)
+    entry["archived"] = bool(conv.get("archived"))
+    return entry
+
+
+def _upsert_memory_entry(memory: dict, conv: dict, summary: str | None = None, keywords: list | None = None, mark_reviewed: bool = False, worth_remembering: bool = True) -> dict:
+    entry = _memory_entry(memory, str(conv.get("id") or ""))
+    if entry is None:
+        entry = {"id": conv.get("id"), "notes": [], "keywords": [], "last_memory_message_count": 0}
+        memory.setdefault("conversations", []).append(entry)
+    _touch_memory_entry(memory, conv)
+    entry["worth_remembering"] = bool(worth_remembering)
+    if summary is not None:
+        entry["summary"] = str(summary).strip()
+    if keywords is not None:
+        entry["keywords"] = [str(x)[:40] for x in keywords if str(x).strip()][:10]
+    if mark_reviewed:
+        entry["last_memory_message_count"] = len(conv.get("messages") or [])
+        entry["last_memory_at"] = utc_now()
+    return entry
+
+
+def sync_memory_entries(memory: dict, conversations: list[dict]) -> dict:
+    by_id = {str(conv.get("id") or ""): conv for conv in conversations}
+    synced = []
+    for entry in memory.get("conversations") or []:
+        conv = by_id.get(str(entry.get("id") or ""))
+        if conv is None:
+            continue
+        entry["title"] = str(conv.get("title") or "对话")[:120]
+        entry["archived"] = bool(conv.get("archived"))
+        entry["turns"] = len(split_turns(conv.get("messages") or []))
+        entry["last_activity_at"] = _conversation_last_activity(conv)
+        synced.append(entry)
+    memory["conversations"] = synced
+    reviews = memory.get("reviews") if isinstance(memory.get("reviews"), dict) else {}
+    memory["reviews"] = {key: value for key, value in reviews.items() if key in by_id}
+    return memory
+
+
+def memory_snapshot_summary(conv: dict) -> dict:
+    snapshot = str(conv.get("memory_snapshot") or "")
+    manual = bool(conv.get("memory_snapshot_manual"))
+    return {
+        "id": conv.get("id"),
+        "title": conv.get("title") or "对话",
+        "archived": bool(conv.get("archived")),
+        "chars": len(snapshot),
+        "deleted": bool(manual and not snapshot),
+        "manual": manual,
+        "updated_at": conv.get("memory_snapshot_updated_at") or conv.get("updated_at"),
+    }
+
+
+def build_memory_snapshot(memory: dict, conversations: list[dict] | None = None) -> str:
+    excluded_ids = set()
+    if conversations is not None:
+        sync_memory_entries(memory, conversations)
+        excluded_ids = {
+            str(conv.get("id") or "")
+            for conv in conversations
+            if conv.get("memory_excluded")
+        }
+    profile = _clean_profile(memory.get("profile"))
+    entries = sorted(
+        (
+            item for item in (memory.get("conversations") or [])
+            if _entry_is_meaningful(item) and str(item.get("id") or "") not in excluded_ids
+        ),
+        key=lambda x: x.get("last_activity_at") or x.get("updated_at") or "",
+        reverse=True,
+    )
+    lines = ["【用户长期画像】", profile or "（暂无）", "", "【历史对话索引】"]
+    for item in entries[:MEMORY_SNAPSHOT_MAX_CONVERSATIONS]:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        tag = "已归档" if item.get("archived") else "可继续"
+        lines.append(f"- {item.get('title')}｜{tag}｜ID: {item.get('id')}｜{summary}")
+    return "\n".join(lines)
+
+
+def memory_search_text(query: str, limit: int = 5) -> str:
+    memory = load_memory()
+    all_conversations = load_conversations()
+    sync_memory_entries(memory, all_conversations)
+    excluded_ids = {
+        str(conv.get("id") or "")
+        for conv in all_conversations
+        if conv.get("memory_excluded")
+    }
+    query_l = str(query or "").lower().strip()
+    tokens = [t for t in re.split(r"\s+", query_l) if t]
+    scored = []
+    for item in memory.get("conversations") or []:
+        if str(item.get("id") or "") in excluded_ids or not _entry_is_meaningful(item):
+            continue
+        notes = item.get("notes") or []
+        hay = " ".join([str(item.get("title") or ""), str(item.get("summary") or ""), " ".join(item.get("keywords") or []), " ".join(notes)]).lower()
+        score = sum(3 if token in str(item.get("title") or "").lower() else 1 for token in tokens if token in hay)
+        if query_l and query_l in hay:
+            score += 5
+        if score or not query_l:
+            scored.append((score, item))
+    scored.sort(key=lambda x: (x[0], x[1].get("updated_at") or ""), reverse=True)
+    results = []
+    for _score, item in scored[:max(1, min(10, limit))]:
+        results.append({
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "archived": bool(item.get("archived")),
+            "summary": item.get("summary"),
+            "keywords": item.get("keywords"),
+            "notes_preview": " ".join(item.get("notes") or [])[:500],
+            "updated_at": item.get("updated_at"),
+        })
+    return json.dumps({"results": results}, ensure_ascii=False, indent=2)
+
+
+def memory_read_text(conversation_id: str) -> str:
+    conversations = load_conversations()
+    conv = next((x for x in conversations if x.get("id") == conversation_id), None)
+    if conv is None:
+        return json.dumps({"error": "conversation_not_found", "message": "找不到这个历史对话"}, ensure_ascii=False)
+    memory = load_memory()
+    entry = _memory_entry(memory, conversation_id)
+    turns = split_turns(conv.get("messages") or [])
+    transcript = _turns_transcript(turns[-8:], limit_chars=20000)
+    return json.dumps({
+        "id": conversation_id,
+        "title": conv.get("title") or "对话",
+        "archived": bool(conv.get("archived")),
+        "saved_notes": (entry.get("notes") or []) if entry else [],
+        "transcript": transcript,
+    }, ensure_ascii=False)
+
+
+def _split_memory_text(text: str, limit: int) -> list[str]:
+    remaining = str(text or "").strip()
+    chunks = []
+    markers = ("\n\n", "\n", "。", "！", "？", "；", ";", ". ", "，", ",")
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        candidates = []
+        for marker in markers:
+            pos = window.rfind(marker)
+            if pos >= limit // 2:
+                candidates.append(pos + len(marker))
+        cut = max(candidates) if candidates else limit
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def memory_save_text(target: str, content: str, mode: str = "append", conversation_id: str = "") -> str:
+    text = str(content or "").strip()
+    target = str(target or "profile").strip()
+    mode = str(mode or "append").strip()
+    if not text:
+        return json.dumps({"error": "内容不能为空"}, ensure_ascii=False)
+    if target not in ("profile", "conversation"):
+        return json.dumps({"error": "unknown_target"}, ensure_ascii=False)
+    if mode not in ("append", "replace"):
+        return json.dumps({"error": "unknown_mode"}, ensure_ascii=False)
+    with FILE_LOCK:
+        memory = load_memory()
+        if target == "profile":
+            old = str(memory.get("profile") or "").strip()
+            if mode == "replace":
+                new_profile = text
+            elif text in old:
+                return json.dumps({"ok": True, "message": "这条记忆已经存在", "profile_chars": len(old)}, ensure_ascii=False)
+            else:
+                new_profile = (old + "\n- " + text).strip() if old else "- " + text
+            if len(new_profile) > PROFILE_MAX_CHARS:
+                return json.dumps({"error": "profile_full", "message": f"画像超过 {PROFILE_MAX_CHARS} 字。请用 mode=replace 提交压缩后的完整画像。", "profile": old, "profile_chars": len(old)}, ensure_ascii=False)
+            memory["profile"] = new_profile
+            save_memory(memory)
+            return json.dumps({"ok": True, "profile_chars": len(new_profile)}, ensure_ascii=False)
+        if len(text) > MEMORY_SAVE_MAX_CHARS:
+            return json.dumps({"error": "memory_too_large", "message": f"单次对话记忆不能超过 {MEMORY_SAVE_MAX_CHARS} 字，请分成多次写入。"}, ensure_ascii=False)
+        conversations = load_conversations()
+        conv = next((x for x in conversations if x.get("id") == conversation_id), None)
+        if conv is None:
+            return json.dumps({"error": "conversation_not_found"}, ensure_ascii=False)
+        if conv.get("memory_excluded"):
+            return json.dumps({"error": "conversation_excluded", "message": "这个对话已被排除出长期记忆"}, ensure_ascii=False)
+        entry = _upsert_memory_entry(memory, conv)
+        notes = list(entry.get("notes") or [])
+        chunks = _split_memory_text(text, MEMORY_NOTE_MAX_CHARS)
+        if mode == "append":
+            new_chunks = [chunk for chunk in chunks if chunk not in notes]
+            if not new_chunks:
+                return json.dumps({"ok": True, "message": "这条记忆已经存在", "notes": len(notes)}, ensure_ascii=False)
+            if len(notes) + len(new_chunks) > MEMORY_NOTE_MAX_ITEMS:
+                return json.dumps({"error": "conversation_memory_full", "message": "当前对话记忆条目已满，请先整理已有记忆或改用画像。", "notes": len(notes), "limit": MEMORY_NOTE_MAX_ITEMS}, ensure_ascii=False)
+            notes.extend(new_chunks)
+        else:
+            if len(chunks) > MEMORY_NOTE_MAX_ITEMS:
+                return json.dumps({"error": "conversation_memory_full", "message": "替换内容超过当前对话记忆容量，请缩短后重试。", "limit": MEMORY_NOTE_MAX_ITEMS}, ensure_ascii=False)
+            notes = chunks
+        entry["notes"] = notes
+        save_memory(memory)
+        return json.dumps({"ok": True, "message": "已写入当前对话记忆", "notes": len(notes), "chunks": len(chunks)}, ensure_ascii=False)
+
+
+def execute_memory_tool(name: str, args: dict, current_conversation_id: str) -> tuple[str, list[dict]]:
+    if name == "memory_search":
+        query = str(args.get("query") or "").strip()
+        try:
+            limit = int(args.get("limit") or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        return memory_search_text(query, limit), []
+    if name == "memory_read_conversation":
+        return memory_read_text(str(args.get("conversation_id") or "").strip()), []
+    if name == "memory_save":
+        return memory_save_text(
+            str(args.get("target") or "profile"),
+            str(args.get("content") or "").strip(),
+            str(args.get("mode") or "append"),
+            current_conversation_id,
+        ), []
+    return json.dumps({"error": "unknown_tool", "message": f"未知工具：{name}"}, ensure_ascii=False), []
+
+
+def memory_search_tool_schema() -> dict:
+    return {"type": "function", "function": {"name": "memory_search", "description": "搜索过去对话的索引。需要引用以前做过的项目、决定或用户偏好时使用；需要细节时再用 memory_read_conversation 读取。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, "required": ["query"]}}}
+
+
+def memory_read_tool_schema() -> dict:
+    return {"type": "function", "function": {"name": "memory_read_conversation", "description": "读取一个历史对话的文字正文。归档对话也可以读取。", "parameters": {"type": "object", "properties": {"conversation_id": {"type": "string"}}, "required": ["conversation_id"]}}}
+
+
+def memory_save_tool_schema() -> dict:
+    return {"type": "function", "function": {"name": "memory_save", "description": "主动保存有长期价值、且有对话原文依据的信息。较长内容会自动分块；不要保存一次性请求、临时状态、寒暄或密钥。", "parameters": {"type": "object", "properties": {"target": {"type": "string", "enum": ["profile", "conversation"]}, "content": {"type": "string", "description": "陈述式的事实或任务要点；长内容会自动分块保存"}, "mode": {"type": "string", "enum": ["append", "replace"], "description": "append 追加；replace 用新内容替换画像或当前对话的笔记"}}, "required": ["target", "content"]}}}
+
+
+def _memory_review_transcript(turns: list[tuple[dict, list[dict]]], limit_chars: int) -> str:
+    selected: list[str] = []
+    total = 0
+    for turn in reversed(turns):
+        block = _turns_transcript([turn], limit_chars=limit_chars)
+        if not block:
+            continue
+        extra = 2 if selected else 0
+        if total + len(block) + extra > limit_chars:
+            if not selected:
+                selected.append(block[:limit_chars])
+            break
+        selected.append(block)
+        total += len(block) + extra
+    if len(selected) < len(turns):
+        selected.append("……（更早内容已省略）")
+    return "\n\n".join(reversed(selected))
+
+
+def _compress_memory_summary(provider: dict, model_id: str, title: str, summary: str) -> str:
+    source = str(summary or "").strip()
+    if len(source) <= MEMORY_INDEX_SUMMARY_MAX_CHARS:
+        return source
+    messages = [
+        {"role": "system", "content": MEMORY_SUMMARY_COMPRESS_SYSTEM},
+        {"role": "user", "content": f"标题：{title}\n\n原摘要：\n{source}"},
+    ]
+    chunks = []
+    try:
+        for event_type, data in stream_chat(provider, model_id, messages, ""):
+            if event_type == "content":
+                chunks.append(str(data.get("text") or ""))
+    except Exception:
+        return ""
+    compressed = re.sub(r"\s+", " ", "".join(chunks)).strip()
+    compressed = compressed.strip(" #*`'\"“”‘’")
+    if not compressed or len(compressed) > MEMORY_INDEX_SUMMARY_MAX_CHARS:
+        return ""
+    return compressed
+
+
+def _memory_scan_worker() -> None:
+    with FILE_LOCK:
+        config = load_config()
+        memory_settings = (config.get("settings") or {}).get("memory") or {}
+        if not memory_settings.get("enabled"):
+            return
+        provider_id = str(memory_settings.get("provider_id") or "")
+        model_id = str(memory_settings.get("model_id") or "")
+        review_prompt = str(memory_settings.get("review_prompt") or MEMORY_REVIEW_SYSTEM).strip()
+        try:
+            provider = provider_by_id(config, provider_id)
+            model_info = find_model(provider, model_id)
+        except ApiError:
+            return
+        if not model_info:
+            return
+        conversations = load_conversations()
+    memory = load_memory()
+    sync_memory_entries(memory, conversations)
+    oversized_summaries = [
+        entry for entry in (memory.get("conversations") or [])
+        if len(str(entry.get("summary") or "")) > MEMORY_INDEX_SUMMARY_MAX_CHARS
+    ][:MEMORY_REVIEW_MAX_CONVERSATIONS]
+    for entry in oversized_summaries:
+        summary = str(entry.get("summary") or "")
+        compressed = _compress_memory_summary(
+            provider,
+            model_id,
+            str(entry.get("title") or "对话"),
+            summary,
+        )
+        if not compressed:
+            continue
+        with FILE_LOCK:
+            fresh = load_memory()
+            fresh_entry = _memory_entry(fresh, str(entry.get("id") or ""))
+            if fresh_entry and len(str(fresh_entry.get("summary") or "")) > MEMORY_INDEX_SUMMARY_MAX_CHARS:
+                fresh_entry["summary"] = compressed
+                fresh_entry["updated_at"] = utc_now()
+                save_memory(fresh)
+    memory = load_memory()
+    sync_memory_entries(memory, conversations)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    due = []
+    for conv in conversations:
+        if conv.get("archived") or conv.get("memory_excluded"):
+            continue
+        messages = conv.get("messages") or []
+        if len(messages) < 2:
+            continue
+        last = _conversation_last_activity(conv)
+        if now_ts - _parse_iso_ts(last) < MEMORY_SCAN_MINUTES * 60:
+            continue
+        review = (memory.get("reviews") or {}).get(str(conv.get("id") or "")) or {}
+        reviewed_count = int(review.get("reviewed_message_count") or 0)
+        if not reviewed_count:
+            entry = _memory_entry(memory, str(conv.get("id") or ""))
+            reviewed_count = int(entry.get("last_memory_message_count") or 0) if entry else 0
+        if reviewed_count and len(messages) <= reviewed_count:
+            continue
+        due.append(conv)
+    for conv in due[:MEMORY_REVIEW_MAX_CONVERSATIONS]:
+        conv_id = str(conv.get("id") or "")
+        turns = split_turns(conv.get("messages") or [])
+        transcript = _memory_review_transcript(turns, MEMORY_REVIEW_CONTEXT_CHARS)
+        entry = _memory_entry(memory, conv_id)
+        prompt = "【现有用户画像】\n" + (str(memory.get("profile") or "") or "（暂无）") + "\n\n【当前对话已有摘要】\n" + (str(entry.get("summary") or "") if entry else "（暂无）") + "\n\n【最近对话】\n" + transcript
+        messages = [{"role": "system", "content": review_prompt}, {"role": "user", "content": prompt}]
+        chunks = []
+        try:
+            for event_type, data in stream_chat(provider, model_id, messages, ""):
+                if event_type == "content":
+                    chunks.append(str(data.get("text") or ""))
+        except Exception as exc:
+            with FILE_LOCK:
+                fresh = load_memory()
+                fresh_conversations = load_conversations()
+                fresh_conv = next((x for x in fresh_conversations if x.get("id") == conv_id), conv)
+                _mark_review_failure(fresh, fresh_conv, str(exc))
+                save_memory(fresh)
+            continue
+        raw = "".join(chunks).strip()
+        if raw.startswith(chr(96) * 3):
+            raw = re.sub(r"^" + chr(96) * 3 + r"[a-zA-Z]*\s*", "", raw)
+            raw = re.sub(r"\s*" + chr(96) * 3 + r"$", "", raw)
+        try:
+            start = raw.index("{")
+            end = raw.rindex("}") + 1
+            result = json.loads(raw[start:end])
+        except (ValueError, json.JSONDecodeError) as exc:
+            with FILE_LOCK:
+                fresh = load_memory()
+                fresh_conversations = load_conversations()
+                fresh_conv = next((x for x in fresh_conversations if x.get("id") == conv_id), conv)
+                _mark_review_failure(fresh, fresh_conv, f"invalid memory JSON: {exc}")
+                save_memory(fresh)
+            continue
+        profile = _clean_profile(result.get("profile") or memory.get("profile"))
+        if len(profile) > PROFILE_MAX_CHARS:
+            with FILE_LOCK:
+                fresh = load_memory()
+                fresh_conversations = load_conversations()
+                fresh_conv = next((x for x in fresh_conversations if x.get("id") == conv_id), conv)
+                _mark_review_failure(
+                    fresh,
+                    fresh_conv,
+                    f"profile_too_long: 画像 {len(profile)} 字，超过 {PROFILE_MAX_CHARS} 字，必须缩短",
+                )
+                save_memory(fresh)
+            continue
+        summary = str(result.get("conversation_summary") or "").strip()
+        if len(summary) > MEMORY_INDEX_SUMMARY_MAX_CHARS:
+            summary = _compress_memory_summary(
+                provider,
+                model_id,
+                str(conv.get("title") or "对话"),
+                summary,
+            )
+            if not summary:
+                with FILE_LOCK:
+                    fresh = load_memory()
+                    fresh_conversations = load_conversations()
+                    fresh_conv = next((x for x in fresh_conversations if x.get("id") == conv_id), conv)
+                    _mark_review_failure(
+                        fresh,
+                        fresh_conv,
+                        f"summary_too_long: 索引摘要超过 {MEMORY_INDEX_SUMMARY_MAX_CHARS} 字，压缩失败",
+                    )
+                    save_memory(fresh)
+                continue
+        keywords = result.get("keywords") if isinstance(result.get("keywords"), list) else []
+        existing_notes = (entry.get("notes") or []) if entry else []
+        worth = result.get("worth_remembering")
+        if not isinstance(worth, bool):
+            worth = bool(summary or existing_notes or (entry and entry.get("summary")))
+        if existing_notes:
+            worth = True
+        if worth and not (summary or existing_notes or keywords):
+            worth = False
+        with FILE_LOCK:
+            fresh = load_memory()
+            fresh_conversations = load_conversations()
+            fresh_conv = next((x for x in fresh_conversations if x.get("id") == conv_id), None)
+            if fresh_conv is None:
+                continue
+            if worth:
+                fresh["profile"] = profile
+                _upsert_memory_entry(
+                    fresh,
+                    fresh_conv,
+                    summary or (entry.get("summary") if entry else ""),
+                    keywords,
+                    mark_reviewed=True,
+                    worth_remembering=True,
+                )
+            else:
+                _remove_memory_entry(fresh, conv_id)
+            _mark_review_success(fresh, fresh_conv, worth)
+            save_memory(fresh)
+
+
+def start_memory_scan() -> bool:
+    if not MEMORY_SCAN_LOCK.acquire(blocking=False):
+        return False
+    def worker():
+        try:
+            _memory_scan_worker()
+        finally:
+            MEMORY_SCAN_LOCK.release()
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
 def build_upstream_messages(conv: dict, exclude_turn_index: int | None = None) -> list[dict]:
     # 每轮对话绑定创建时选中的提示词原文，后续修改预设不会改变旧对话。
-    system_text = str(conv.get("system_prompt") or SYSTEM_PROMPT).strip() or SYSTEM_PROMPT
+    if "system_prompt" in conv:
+        system_text = str(conv.get("system_prompt") or "").strip()
+    else:
+        system_text = SYSTEM_PROMPT
     # 这一段工具规则始终固定，开关只决定是否允许执行工具，避免破坏前缀缓存。
     tool_rules = str(conv.get("tool_instructions") or DEFAULT_TOOL_INSTRUCTIONS).strip()
     environment_note = str(conv.get("environment") or "").strip() or build_environment_note()
     messages = [{"role": "system", "content": tool_rules}]
+    memory_snapshot = str(conv.get("memory_snapshot") or "").strip()
+    if memory_snapshot:
+        messages.append({"role": "system", "content": memory_snapshot})
     messages.append({"role": "system", "content": environment_note})
-    messages.append({"role": "system", "content": system_text})
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
     digest = conv.get("digest") or {}
     digest_text = str(digest.get("text") or "").strip()
     if digest_text:
@@ -1363,11 +2296,16 @@ def _extract_firecrawl_results(data: dict, max_results: int) -> list[dict]:
     return results
 
 
-def firecrawl_search(api_key: str, query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list[dict]:
+def firecrawl_search(api_key: str, query: str, max_results: int = WEB_SEARCH_DEFAULT_RESULTS) -> list[dict]:
+    try:
+        limit = int(max_results or WEB_SEARCH_DEFAULT_RESULTS)
+    except (TypeError, ValueError):
+        limit = WEB_SEARCH_DEFAULT_RESULTS
+    limit = max(1, min(WEB_SEARCH_MAX_RESULTS, limit))
     body = json.dumps(
         {
             "query": query,
-            "limit": max(1, min(WEB_SEARCH_MAX_RESULTS, int(max_results or WEB_SEARCH_MAX_RESULTS))),
+            "limit": limit,
             "scrapeOptions": {"formats": ["markdown"], "onlyMainContent": True},
         },
         ensure_ascii=False,
@@ -1401,7 +2339,7 @@ def firecrawl_search(api_key: str, query: str, max_results: int = WEB_SEARCH_MAX
     if not isinstance(data, dict) or data.get("success") is False:
         detail = _extract_error_message(raw)
         raise UpstreamError(f"Firecrawl 搜索失败：{detail}")
-    results = _extract_firecrawl_results(data, max_results)
+    results = _extract_firecrawl_results(data, limit)
     if not results:
         raise UpstreamError("Firecrawl 没有返回搜索结果")
     return results
@@ -1556,6 +2494,8 @@ def run_tool_loop(
     web_enabled: bool,
     web_api_key: str,
     web_max_results: int,
+    memory_enabled: bool,
+    current_conversation_id: str,
     emit,
     assistant: dict,
 ) -> None:
@@ -1611,7 +2551,7 @@ def run_tool_loop(
                         "role": "system",
                         "content": "模型刚才试图调用 web_search，但用户当前关闭了联网搜索。请用简体中文直接告诉用户：需要点击输入框中的地球按钮开启联网搜索，然后才能查询实时或网络信息。不要输出 DSML、XML 或工具调用代码，也不要假装已经完成搜索。",
                     })
-                    active_tools = None
+                    active_tools = [t for t in (active_tools or []) if t.get("function", {}).get("name") != "web_search"] or None
                     disabled_notice_sent = True
                     continue
             if round_index == 0 and web_enabled and not assistant.get("search_sources"):
@@ -1649,78 +2589,81 @@ def run_tool_loop(
                         "role": "system",
                         "content": "【本轮联网搜索结果，请基于这些结果回答用户问题，并在使用处附来源链接】\n" + result_text,
                     })
-                    active_tools = None
+                    active_tools = [t for t in (active_tools or []) if t.get("function", {}).get("name") != "web_search"] or None
                     assistant["status"] = "正在整理搜索结果"
                     emit("status", {"message": assistant["status"]})
                     continue
             return
-        if not web_enabled:
-            calls = normalize_tool_calls(pending)
-            active.append({
-                "role": "assistant",
-                "content": "".join(round_content) or None,
-                "tool_calls": [
-                    {"id": item["id"], "type": "function", "function": item["function"]}
-                    for item in calls
-                ],
-            })
-            for item in calls:
-                query = str(item["_args"].get("query") or "").strip()
-                index = start_tool_event(assistant, emit, item["function"]["name"], query)
-                finish_tool_event(assistant, emit, index, 0, "联网搜索未开启")
-                active.append({
-                    "role": "tool",
-                    "tool_call_id": item["id"],
-                    "content": json.dumps({
-                        "error": "web_search_disabled",
-                        "message": "用户当前关闭了联网搜索。不要重试。请用简体中文直接告诉用户：需要点击输入框中的地球按钮开启联网搜索，然后才能查询实时或网络信息。",
-                    }, ensure_ascii=False),
-                })
-            active_tools = None
-            continue
+
         if round_index >= TOOL_MAX_ROUNDS:
             raise UpstreamError("工具调用次数超过限制，已停止本次回答")
 
         calls = normalize_tool_calls(pending)
-        tool_message = {
+        active.append({
             "role": "assistant",
             "content": "".join(round_content) or None,
             "tool_calls": [
                 {"id": item["id"], "type": "function", "function": item["function"]}
                 for item in calls
             ],
-        }
-        active.append(tool_message)
-
+        })
+        web_disabled_hit = False
         for item in calls:
             name = item["function"]["name"]
-            query = str(item["_args"].get("query") or "").strip()
-            tool_index = None
+            args = item["_args"]
             if name == "web_search":
-                tool_index = start_tool_event(assistant, emit, name, query)
-                if query:
-                    assistant["status"] = f"正在联网搜索：{query}"
-                    emit("status", {"message": assistant["status"]})
-            text, sources = execute_web_tool(item, web_api_key, web_max_results)
+                display_query = str(args.get("query") or "").strip()
+            elif name == "memory_search":
+                display_query = str(args.get("query") or "").strip()
+            elif name == "memory_read_conversation":
+                display_query = str(args.get("conversation_id") or "").strip()
+            elif name == "memory_save":
+                display_query = str(args.get("content") or "").strip()[:80]
+            else:
+                display_query = ""
+            tool_index = start_tool_event(assistant, emit, name, display_query)
+            assistant["status"] = f"正在使用工具：{name}"
+            emit("status", {"message": assistant["status"]})
+            sources: list[dict] = []
             error_text = ""
+            if name == "web_search":
+                if not web_enabled:
+                    text = json.dumps({
+                        "error": "web_search_disabled",
+                        "message": "用户当前关闭了联网搜索。不要重试。请用简体中文直接告诉用户：需要点击输入框中的地球按钮开启联网搜索，然后才能查询实时或网络信息。",
+                    }, ensure_ascii=False)
+                    error_text = "联网搜索未开启"
+                    web_disabled_hit = True
+                else:
+                    text, sources = execute_web_tool(item, web_api_key, web_max_results)
+                    if text.startswith("搜索失败"):
+                        error_text = text
+                        emit("notice", {"message": text})
+            elif name in ("memory_search", "memory_read_conversation", "memory_save"):
+                if not memory_enabled:
+                    text = json.dumps({"error": "memory_disabled", "message": "记忆功能当前未开启"}, ensure_ascii=False)
+                    error_text = "记忆功能未开启"
+                else:
+                    text, sources = execute_memory_tool(name, args, current_conversation_id)
+                    try:
+                        result_obj = json.loads(text)
+                        if isinstance(result_obj, dict) and result_obj.get("error"):
+                            error_text = str(result_obj.get("error"))
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+            else:
+                text = json.dumps({"error": "unknown_tool", "message": f"未知工具：{name}"}, ensure_ascii=False)
+                error_text = "未知工具"
             if sources:
                 known = assistant.setdefault("search_sources", [])
                 for source in sources:
                     if source not in known:
                         known.append(source)
-            elif text.startswith("搜索失败"):
-                error_text = text
-                emit("notice", {"message": text})
-            if tool_index is not None:
-                finish_tool_event(assistant, emit, tool_index, len(sources), error_text)
-            active.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": item["id"],
-                    "content": text,
-                }
-            )
-        assistant["status"] = "正在整理搜索结果"
+            finish_tool_event(assistant, emit, tool_index, len(sources), error_text)
+            active.append({"role": "tool", "tool_call_id": item["id"], "content": text})
+        if web_disabled_hit:
+            active_tools = [t for t in (active_tools or []) if t.get("function", {}).get("name") != "web_search"] or None
+        assistant["status"] = "正在整理工具结果"
         emit("status", {"message": assistant["status"]})
 
 
@@ -1917,7 +2860,7 @@ def stream_chat(
 
 INDEX_HTML = r'''
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-font-size="normal">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -1976,6 +2919,7 @@ a:hover { text-decoration: underline; }
 ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .12); border-radius: 999px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .2); }
 .hidden { display: none !important; }
+:root { --reading-font-scale: 1; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
 .ambient {
@@ -2032,6 +2976,9 @@ a:hover { text-decoration: underline; }
 }
 .new-chat:hover { background: rgba(120,169,255,.13); border-color: rgba(120,169,255,.38); transform: translateY(-1px); }
 .new-chat svg { width: 15px; height: 15px; }
+.history-search-btn { margin-left: auto; width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.02); color: var(--faint); }
+.history-search-btn:hover { color: var(--accent); border-color: rgba(120,169,255,.3); background: rgba(120,169,255,.08); }
+.history-search-btn svg { width: 13px; height: 13px; }
 .history-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 22px 10px 9px; color: var(--faint); font-size: 10px; font-weight: 650;
@@ -2115,6 +3062,25 @@ a:hover { text-decoration: underline; }
 
 .page { flex: 1; min-height: 0; }
 .chat-page { position: relative; display: flex; flex-direction: column; }
+.chat-page.has-turn-nav .chat-scroll { padding-right: 30px; }
+.turn-nav { position: absolute; z-index: 8; top: 18px; right: 7px; width: 26px; max-height: min(62vh, 620px); display: flex; flex-direction: column; padding: 6px 4px; overflow: hidden; border: 1px solid transparent; border-radius: 14px; background: transparent; box-shadow: none; backdrop-filter: blur(0); transition: width .18s ease, padding .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease; }
+.turn-nav:hover, .turn-nav:focus-within { width: 226px; padding: 12px; border-color: rgba(255,255,255,.1); background: rgba(17,21,26,.9); box-shadow: 0 18px 50px rgba(0,0,0,.34); backdrop-filter: blur(16px); }
+.turn-nav-head { display: none; justify-content: space-between; gap: 8px; padding: 0 3px 8px; color: var(--text-soft); font-size: 10px; font-weight: 600; border-bottom: 1px solid var(--line); }
+.turn-nav:hover .turn-nav-head, .turn-nav:focus-within .turn-nav-head { display: flex; }
+.turn-nav-count { color: var(--faint); font-family: var(--mono); font-size: 8.5px; font-weight: 400; }
+.turn-nav-list { display: flex; flex-direction: column; align-items: center; gap: 5px; margin-top: 0; overflow-y: auto; scrollbar-width: none; }
+.turn-nav-list::-webkit-scrollbar { display: none; }
+.turn-nav:hover .turn-nav-list, .turn-nav:focus-within .turn-nav-list { align-items: stretch; gap: 3px; margin-top: 7px; scrollbar-width: thin; }
+.turn-nav-item { width: 18px; height: 18px; display: grid; place-items: center; padding: 0; border: 0; border-left: 2px solid transparent; border-radius: 50%; background: transparent; color: var(--muted); text-align: left; font-size: 10.5px; line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.turn-nav-dot { width: 5px; height: 5px; border-radius: 50%; background: rgba(180,190,205,.42); transition: .15s ease; }
+.turn-nav-text { display: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.turn-nav:hover .turn-nav-item, .turn-nav:focus-within .turn-nav-item { width: 100%; height: auto; min-height: 28px; display: block; padding: 7px 7px 7px 10px; border-radius: 7px; }
+.turn-nav:hover .turn-nav-dot, .turn-nav:focus-within .turn-nav-dot { display: none; }
+.turn-nav:hover .turn-nav-text, .turn-nav:focus-within .turn-nav-text { display: block; }
+.turn-nav-item:hover { color: var(--text-soft); background: rgba(255,255,255,.045); }
+.turn-nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(120,169,255,.08); }
+.turn-nav-item.active .turn-nav-dot { width: 7px; height: 7px; background: var(--accent); box-shadow: 0 0 0 3px rgba(120,169,255,.12); }
+@media (max-width: 760px) and (hover: none) { .turn-nav { display: none !important; } }
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 30px 0; scroll-behavior: smooth; }
 .message-list { width: min(100%, 880px); margin: 0 auto; padding: 0 0 42px; }
 
@@ -2283,6 +3249,17 @@ a:hover { text-decoration: underline; }
 .search-sources { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 3px; }
 .search-sources a { max-width: 320px; overflow: hidden; padding: 3px 8px; border: 1px solid rgba(120,169,255,.16); border-radius: 999px; background: rgba(120,169,255,.05); color: var(--muted); font-size: 9.5px; text-decoration: none; white-space: nowrap; text-overflow: ellipsis; }
 .search-sources a:hover { color: var(--accent); border-color: rgba(120,169,255,.38); text-decoration: none; }
+.source-more { display: inline-flex; align-items: center; }
+.source-more > summary { list-style: none; cursor: pointer; padding: 3px 8px; border: 1px solid rgba(120,169,255,.16); border-radius: 999px; color: var(--accent); background: rgba(120,169,255,.05); font-size: 9.5px; }
+.source-more > summary::-webkit-details-marker { display: none; }
+.source-more-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chat-search-modal { width: min(100%, 760px); max-height: min(90dvh, 760px); display: flex; flex-direction: column; }
+.chat-search-results { display: flex; flex-direction: column; gap: 7px; min-height: 120px; overflow-y: auto; padding-right: 2px; }
+.chat-search-result { display: flex; flex-direction: column; gap: 5px; width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.018); text-align: left; }
+.chat-search-result:hover { border-color: rgba(120,169,255,.3); background: rgba(120,169,255,.055); }
+.chat-search-result-head { display: flex; justify-content: space-between; gap: 12px; color: var(--text-soft); font-size: 11px; }
+.chat-search-result-head small { flex: 0 0 auto; color: var(--faint); font-size: 9px; }
+.chat-search-result-snippet { color: var(--muted); font-size: 10.5px; line-height: 1.6; }
 .tool-events { display: flex; flex-direction: column; gap: 5px; margin: 4px 0 9px; }
 .tool-events.hidden { display: none; }
 .tool-event { display: flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid rgba(120,169,255,.16); border-radius: 8px; background: rgba(120,169,255,.04); color: var(--muted); font-size: 10px; line-height: 1.4; }
@@ -2319,11 +3296,44 @@ a:hover { text-decoration: underline; }
 .switch input:checked + span::after { transform: translateX(18px); background: var(--accent); }
 .settings-hint { margin: 6px 0 14px; color: var(--faint); font-size: 10.5px; line-height: 1.7; }
 .settings-card .field { margin-top: 14px; }
+.memory-model-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.memory-model-row select { width: 100%; }
+.memory-review-prompt-textarea { min-height: 190px; max-height: 42vh; }
+.memory-prompt-details { margin-top: 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.018); overflow: hidden; }
+.memory-prompt-details > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 13px; color: var(--text-soft); font-size: 10.5px; font-weight: 600; cursor: pointer; list-style: none; }
+.memory-prompt-details > summary::-webkit-details-marker { display: none; }
+.memory-prompt-toggle { color: var(--faint); font-family: var(--mono); font-size: 8.5px; font-weight: 400; }
+.memory-prompt-details[open] > summary { border-bottom: 1px solid var(--line); background: rgba(120,169,255,.035); }
+.memory-prompt-details[open] .memory-prompt-toggle { font-size: 0; }
+.memory-prompt-details[open] .memory-prompt-toggle::after { content: "收起"; font-size: 8.5px; }
+.memory-prompt-body { padding: 12px 13px 13px; }
+.memory-prompt-body .field { margin-top: 0; }
+.memory-prompt-detail-actions { display: flex; justify-content: flex-end; }
+.memory-actions { display: flex; gap: 8px; margin-top: 16px; }
+.memory-summary-card { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.018); }
+.memory-section-title { margin: 4px 0 8px; color: var(--text); font-size: 12px; font-weight: 600; }
+.memory-section-title span { color: var(--faint); font-family: var(--mono); font-size: 9px; font-weight: 400; }
+.memory-profile-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 8px; }
+.memory-profile-head .memory-section-title { margin: 0; }
+.memory-profile { width: 100%; min-height: 150px; max-height: 360px; margin: 0 0 8px; overflow: auto; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; outline: none; resize: vertical; box-sizing: border-box; background: #0d1115; color: var(--text-soft); font: 11.5px/1.75 var(--font); white-space: pre-wrap; }
+.memory-profile:focus { border-color: rgba(120,169,255,.45); box-shadow: 0 0 0 3px rgba(120,169,255,.08); }
+#memoryProfileCount.over-limit { color: var(--danger); }
+#memoryIndexSummaryCount.over-limit { color: var(--danger); }
+.memory-index-list { display: flex; flex-direction: column; gap: 7px; }
+.memory-index-item { padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.018); }
+.memory-index-title { color: var(--text-soft); font-size: 11.5px; font-weight: 600; }
+.memory-index-summary { margin-top: 3px; color: var(--muted); font-size: 10.5px; line-height: 1.65; }
+.memory-index-meta { margin-top: 4px; color: var(--faint); font-family: var(--mono); font-size: 8.5px; }
+.memory-index-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.memory-index-actions .secondary-btn { min-height: 28px; padding: 0 9px; font-size: 10px; }
+.memory-index-textarea { min-height: 220px; }
+.memory-index-sync-title { margin: 2px 0 14px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.02); color: var(--muted); font-size: 10.5px; }
+.memory-index-sync-title strong { color: var(--text-soft); font-weight: 600; }
 .attach-btn.active { color: #0b1524; border-color: rgba(120,169,255,.6); background: var(--accent); }
 .attach-btn.active svg { color: #0b1524; }
 .attachment-strip { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 2px 10px; }
 .attachment-item { position: relative; width: 62px; height: 62px; border: 1px solid var(--line-strong); border-radius: 10px; overflow: hidden; background: #0a0d10; }
-.attachment-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attachment-item img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
 .attachment-remove { position: absolute; top: 3px; right: 3px; width: 18px; height: 18px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.18); border-radius: 50%; background: rgba(8,11,13,.78); color: #fff; }
 .attachment-remove:hover { background: rgba(255,100,118,.85); }
 .attachment-remove svg { width: 9px; height: 9px; }
@@ -2399,6 +3409,10 @@ a:hover { text-decoration: underline; }
 .settings-tab.active { color: var(--text); background: rgba(120,169,255,.13); }
 .tab-count { min-width: 18px; height: 18px; padding: 0 5px; display: inline-grid; place-items: center; border-radius: 999px; background: rgba(255,255,255,.08); color: var(--text-soft); font-family: var(--mono); font-size: 9px; line-height: 1; }
 .prompt-picker-shell select { max-width: 142px; }
+.prompt-lock { max-width: 176px; flex: 0 1 auto; min-width: 0; cursor: default; }
+.prompt-lock span.prompt-lock-label { flex: 0 0 auto; color: var(--faint); }
+.prompt-lock .prompt-lock-name { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: 11.5px; white-space: nowrap; text-overflow: ellipsis; }
+.prompt-lock .prompt-lock-icon { flex: 0 0 11px; width: 11px; height: 11px; color: var(--faint); opacity: .75; }
 .prompt-list { display: flex; flex-direction: column; gap: 10px; }
 .prompt-card { padding: 15px 16px; border: 1px solid var(--line); border-radius: 13px; background: linear-gradient(150deg, rgba(255,255,255,.028), rgba(255,255,255,.012)); }
 .prompt-card.active { border-color: rgba(120,169,255,.34); background: rgba(120,169,255,.055); }
@@ -2500,8 +3514,11 @@ a:hover { text-decoration: underline; }
 .modal-close { flex: 0 0 29px; width: 29px; height: 29px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.02); color: var(--faint); }
 .modal-close:hover { color: var(--text); background: rgba(255,255,255,.05); }
 .modal-close svg { width: 14px; height: 14px; }
-.image-viewer { position: relative; max-width: min(94vw, 1200px); max-height: 92dvh; display: flex; align-items: center; justify-content: center; }
-.image-viewer img { display: block; max-width: 100%; max-height: 90dvh; border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 30px 90px rgba(0,0,0,.65); }
+.image-viewer { position: relative; width: min(94vw, 1280px); height: min(90dvh, 900px); display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: none; }
+.image-viewer img { display: block; max-width: 100%; max-height: 100%; border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 30px 90px rgba(0,0,0,.65); transform-origin: center center; cursor: zoom-in; user-select: none; -webkit-user-drag: none; }
+.image-viewer.zoomed img { cursor: grab; }
+.image-viewer.dragging img { cursor: grabbing; }
+.image-viewer-hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 999px; background: rgba(8,11,13,.74); color: rgba(232,237,245,.7); font-size: 10px; white-space: nowrap; pointer-events: none; backdrop-filter: blur(8px); }
 .image-viewer-close { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.2); border-radius: 50%; background: rgba(8,11,13,.82); color: #fff; }
 .image-viewer-close:hover { background: rgba(255,255,255,.14); }
 .image-viewer-close svg { width: 14px; height: 14px; }
@@ -2602,6 +3619,17 @@ a:hover { text-decoration: underline; }
 .math-inline > .katex { font-size: 1.06em; }
 .math-display > .katex-display > .katex { font-size: 1.08em; }
 .katex-error { color: var(--danger) !important; }
+.katex .mord.text, .katex .mord.textord { font-family: var(--font); }
+.font-stepper { display: inline-flex; align-items: center; gap: 7px; }
+.font-step-btn { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: rgba(255,255,255,.03); color: var(--text-soft); font-size: 16px; line-height: 1; }
+.font-step-btn:hover:not(:disabled) { color: var(--accent); border-color: rgba(120,169,255,.35); background: rgba(120,169,255,.08); }
+.font-step-btn:disabled { opacity: .35; cursor: default; }
+.font-stepper strong { min-width: 52px; color: var(--text-soft); font-family: var(--mono); font-size: 11px; text-align: center; }
+.markdown { font-size: calc(13.6px * var(--reading-font-scale)); }
+.user-bubble { font-size: calc(13.5px * var(--reading-font-scale)); }
+.composer textarea { font-size: calc(13.5px * var(--reading-font-scale)); }
+.history-title { font-size: calc(12.5px * var(--reading-font-scale)); }
+.history-meta { font-size: calc(10px * var(--reading-font-scale)); }
 </style>
 </head>
 <body>
@@ -2614,6 +3642,7 @@ a:hover { text-decoration: underline; }
   <symbol id="i-edit" viewBox="0 0 24 24"><path d="m14.5 5.5 4 4M5 19l2.3-.4L19 7a2.1 2.1 0 0 0-3-3L4.4 15.7 4 19h1Z" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15.5" r="3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 13 8-8M16 7l2 2M14 9l1.5 1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
   <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m15.3 15.3 4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round"/></symbol>
   <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5.4c0 4.3 2.9 7.9 7 9.6 4.1-1.7 7-5.3 7-9.6V6l-7-3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
@@ -2655,7 +3684,7 @@ a:hover { text-decoration: underline; }
     <button class="new-chat" id="newChatBtn" type="button">
       <svg><use href="#i-plus"></use></svg><span>新建对话</span>
     </button>
-    <div class="history-head"><span>历史对话</span><span class="history-count" id="historyCount">0</span></div>
+    <div class="history-head"><span>历史对话</span><span class="history-count" id="historyCount">0</span><button class="history-search-btn" id="chatSearchBtn" type="button" aria-label="搜索历史对话" title="搜索标题和原文"><svg><use href="#i-search"></use></svg></button></div>
     <div class="history-list" id="historyList"></div>
     <div class="sidebar-foot">
       <span class="status-dot" id="statusDot"></span>
@@ -2674,7 +3703,8 @@ a:hover { text-decoration: underline; }
         </div>
       </div>
       <div class="topbar-actions" id="chatControls">
-        <label class="select-shell prompt-picker-shell"><span>提示词</span><select id="promptPicker" aria-label="选择系统提示词"></select></label>
+        <label class="select-shell prompt-picker-shell" id="promptPickerShell"><span>提示词</span><select id="promptPicker" aria-label="选择系统提示词"></select></label>
+        <div class="select-shell prompt-lock hidden" id="promptLock" role="status"><svg class="prompt-lock-icon"><use href="#i-shield"></use></svg><span class="prompt-lock-label">提示词</span><span class="prompt-lock-name" id="promptLockName"></span></div>
         <label class="select-shell"><span>供应商</span><select id="providerSelect" aria-label="选择供应商"></select></label>
         <label class="select-shell"><span>模型</span><select id="modelSelect" aria-label="选择模型"></select></label>
         <label class="select-shell"><span>思考强度</span><select id="effortSelect" aria-label="选择思考强度"></select></label>
@@ -2701,6 +3731,10 @@ a:hover { text-decoration: underline; }
         </div>
         <div class="message-list" id="messageList"></div>
       </div>
+      <nav class="turn-nav hidden" id="turnNav" aria-label="会话问题导航">
+        <div class="turn-nav-head"><span>问题导航</span><span class="turn-nav-count" id="turnNavCount"></span></div>
+        <div class="turn-nav-list" id="turnNavList"></div>
+      </nav>
       <div class="composer-wrap">
         <div class="jump-wrap hidden" id="jumpWrap">
           <button class="context-jump" id="jumpBtn" type="button">↓ 回到最新</button>
@@ -2732,10 +3766,33 @@ a:hover { text-decoration: underline; }
     <section class="page settings-page hidden" id="settingsPage">
       <div class="settings-scroll">
         <div class="settings-tabs" id="settingsTabs">
+          <button class="settings-tab" type="button" data-settings-tab="general">通用</button>
           <button class="settings-tab active" type="button" data-settings-tab="models">模型配置</button>
           <button class="settings-tab" type="button" data-settings-tab="prompts">系统提示词</button>
+          <button class="settings-tab" type="button" data-settings-tab="memory">记忆</button>
           <button class="settings-tab" type="button" data-settings-tab="web">联网搜索</button>
           <button class="settings-tab" type="button" data-settings-tab="archive">归档 <span class="tab-count" id="archiveCount">0</span></button>
+        </div>
+        <div id="generalSettingsPanel" class="hidden">
+          <div class="settings-heading">
+            <div>
+              <div class="eyebrow">GENERAL</div>
+              <h1>通用设置</h1>
+              <p>这里保存界面相关的个人偏好。当前字体设置只影响这个浏览器，不会修改对话内容。</p>
+            </div>
+          </div>
+          <section class="settings-card">
+            <div class="settings-row">
+              <div><strong>对话字体大小</strong><span>调整聊天正文、用户消息和输入框的字号。</span></div>
+              <div class="font-stepper" aria-label="调整对话字体大小">
+                <button class="font-step-btn" id="generalFontMinus" type="button" aria-label="减小字体">−</button>
+                <strong id="generalFontValue">100%</strong>
+                <button class="font-step-btn" id="generalFontPlus" type="button" aria-label="增大字体">+</button>
+              </div>
+            </div>
+            <div class="settings-hint">选择后会立即生效，并保存在当前浏览器本地。</div>
+            <div class="memory-actions"><button class="secondary-btn" id="resetGeneralSettingsBtn" type="button">恢复默认外观</button></div>
+          </section>
         </div>
         <div id="modelSettingsPanel">
           <div class="settings-heading">
@@ -2771,6 +3828,50 @@ a:hover { text-decoration: underline; }
           </div>
           <div class="prompt-list" id="promptList"></div>
         </div>
+        <div id="memorySettingsPanel" class="hidden">
+          <div class="settings-heading">
+            <div>
+              <div class="eyebrow">LONG-TERM MEMORY</div>
+              <h1>记忆</h1>
+              <p>用户画像和最近 40 条对话索引会在新对话开始时冻结注入。历史细节可以在对话中由模型按需读取。</p>
+            </div>
+            <button class="secondary-btn" id="refreshMemoryBtn" type="button">刷新</button>
+          </div>
+          <section class="settings-card">
+            <div class="settings-row">
+              <div><strong>启用长期记忆</strong><span>关闭后不再注入记忆，也不向模型提供记忆工具；已有记忆文件会保留。</span></div>
+              <label class="switch"><input type="checkbox" id="memoryEnabledToggle"><span></span></label>
+            </div>
+            <div class="memory-model-row">
+              <label class="field"><span>整理记忆的供应商</span><select class="input" id="memoryProviderSelect"></select></label>
+              <label class="field"><span>整理记忆的模型</span><select class="input" id="memoryModelSelect"></select></label>
+            </div>
+            <details class="memory-prompt-details">
+              <summary><span>记忆整理提示词（画像与索引）</span><span class="memory-prompt-toggle">展开</span></summary>
+              <div class="memory-prompt-body">
+                <div class="settings-hint">这段提示词同时决定用户画像的分类整理，以及对话索引的摘要、关键词和价值判断。</div>
+                <label class="field"><textarea class="modal-textarea memory-review-prompt-textarea" id="memoryReviewPrompt" maxlength="30000" spellcheck="false"></textarea></label>
+                <div class="settings-hint">保存后从下一次记忆检查开始生效，不修改已有快照。</div>
+                <div class="memory-prompt-detail-actions"><button class="secondary-btn" id="resetMemoryPromptBtn" type="button">恢复默认提示词</button></div>
+              </div>
+            </details>
+            <div class="memory-actions">
+              <button class="primary-btn" id="saveMemorySettingsBtn" type="button">保存记忆设置</button>
+              <button class="secondary-btn" id="scanMemoryBtn" type="button">立即检查更新</button>
+            </div>
+          </section>
+          <section class="memory-summary-card">
+            <div class="memory-profile-head">
+              <div class="memory-section-title">用户画像 <span id="memoryProfileCount"></span></div>
+              <button class="secondary-btn" id="saveMemoryProfileBtn" type="button">保存画像</button>
+            </div>
+            <textarea class="memory-profile" id="memoryProfile" rows="7" maxlength="2500" spellcheck="false" placeholder="手动填写或修改长期用户画像……"></textarea>
+            <div class="settings-hint">这里可以直接编辑并保存。下一次新建对话时会使用保存后的画像快照。</div>
+            <div class="memory-section-title">对话索引 <span id="memoryIndexCount"></span></div>
+            <div class="settings-hint" id="memoryRetryInfo"></div>
+            <div class="memory-index-list" id="memoryIndexList"></div>
+          </section>
+        </div>
         <div id="webSettingsPanel" class="hidden">
           <div class="settings-heading">
             <div>
@@ -2786,7 +3887,7 @@ a:hover { text-decoration: underline; }
             </div>
             <label class="field"><span>Firecrawl API Key</span><input class="input" id="firecrawlKey" type="password" autocomplete="off" placeholder="fc-..."></label>
             <div class="settings-hint" id="firecrawlKeyHint"></div>
-            <label class="field"><span>每次搜索结果数</span><input class="input" id="webMaxResults" type="number" min="1" max="5" value="5"></label>
+            <label class="field"><span>每次搜索结果数 <small>1–50，默认 10</small></span><input class="input" id="webMaxResults" type="number" min="1" max="50" value="10"></label>
             <div style="margin-top:16px"><button class="primary-btn" id="saveWebSettingsBtn" type="button">保存搜索设置</button></div>
           </section>
         </div>
@@ -2811,6 +3912,10 @@ a:hover { text-decoration: underline; }
 <script>
 if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/libs/KaTeX/0.16.11/katex.min.js"><\/script>');
 </script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/mhchem.min.js" crossorigin="anonymous" onerror="window.__mhchemLoadFailed=true"></script>
+<script>
+if (window.__mhchemLoadFailed) document.write('<script src="https://cdn.bootcdn.net/ajax/libs/KaTeX/0.16.11/contrib/mhchem.min.js"><\/script>');
+</script>
 <script>
 (() => {
   "use strict";
@@ -2820,6 +3925,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     conversations: [],
     archivedConversations: [],
     settingsTab: "models",
+    fontSize: 100,
     currentId: null,
     current: null,
     messages: [],
@@ -2833,11 +3939,14 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     autoScroll: true,
     contextInfo: null,
     lastScrollTop: 0,
+    scrollPauseUntil: 0,
     prompts: [],
     activePromptId: "",
     promptSelection: "",
-    webSettings: { enabled: false, configured: false, key_hint: "", max_results: 5 },
+    webSettings: { enabled: false, configured: false, key_hint: "", max_results: 10 },
     webSearchEnabled: false,
+    memorySettings: { enabled: false, provider_id: "", model_id: "", review_prompt: "", default_review_prompt: "" },
+    memoryData: { profile: "", profile_limit: 2500, conversations: [], updated_at: null },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -2857,11 +3966,8 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     model: "xxh.model.",
     effort: "xxh.effort.",
     prompt: "xxh.prompt",
+    fontSize: "xxh.fontSize",
   };
-  const MAX_IMAGES = 4;
-  const MAX_FILES = 4;
-  const MAX_DOCUMENT_IMAGES = 8;
-  const MAX_DOCUMENT_IMAGE_CHARS = 10_000_000;
   const MAX_IMAGE_EDGE = 1600;
 
   const el = {
@@ -2873,6 +3979,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     newChatBtn: $("#newChatBtn"),
     historyList: $("#historyList"),
     historyCount: $("#historyCount"),
+    chatSearchBtn: $("#chatSearchBtn"),
     statusDot: $("#statusDot"),
     localStatus: $("#localStatus"),
     pageEyebrow: $("#pageEyebrow"),
@@ -2882,12 +3989,35 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     modelSelect: $("#modelSelect"),
     effortSelect: $("#effortSelect"),
     chatPage: $("#chatPage"),
+    turnNav: $("#turnNav"),
+    turnNavList: $("#turnNavList"),
+    turnNavCount: $("#turnNavCount"),
     settingsPage: $("#settingsPage"),
     settingsTabs: $("#settingsTabs"),
+    generalSettingsPanel: $("#generalSettingsPanel"),
+    generalFontMinus: $("#generalFontMinus"),
+    generalFontPlus: $("#generalFontPlus"),
+    generalFontValue: $("#generalFontValue"),
+    resetGeneralSettingsBtn: $("#resetGeneralSettingsBtn"),
     modelSettingsPanel: $("#modelSettingsPanel"),
     promptSettingsPanel: $("#promptSettingsPanel"),
     promptList: $("#promptList"),
     addPromptBtn: $("#addPromptBtn"),
+    memorySettingsPanel: $("#memorySettingsPanel"),
+    memoryEnabledToggle: $("#memoryEnabledToggle"),
+    memoryProviderSelect: $("#memoryProviderSelect"),
+    memoryModelSelect: $("#memoryModelSelect"),
+    memoryReviewPrompt: $("#memoryReviewPrompt"),
+    resetMemoryPromptBtn: $("#resetMemoryPromptBtn"),
+    memoryProfile: $("#memoryProfile"),
+    memoryProfileCount: $("#memoryProfileCount"),
+    saveMemoryProfileBtn: $("#saveMemoryProfileBtn"),
+    memoryIndexList: $("#memoryIndexList"),
+    memoryIndexCount: $("#memoryIndexCount"),
+    memoryRetryInfo: $("#memoryRetryInfo"),
+    saveMemorySettingsBtn: $("#saveMemorySettingsBtn"),
+    scanMemoryBtn: $("#scanMemoryBtn"),
+    refreshMemoryBtn: $("#refreshMemoryBtn"),
     archiveSettingsPanel: $("#archiveSettingsPanel"),
     archiveList: $("#archiveList"),
     archiveCount: $("#archiveCount"),
@@ -2920,7 +4050,10 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     attachmentStrip: $("#attachmentStrip"),
     addProviderBtn: $("#addProviderBtn"),
     providerGrid: $("#providerGrid"),
+    promptPickerShell: $("#promptPickerShell"),
     promptPicker: $("#promptPicker"),
+    promptLock: $("#promptLock"),
+    promptLockName: $("#promptLockName"),
     modalRoot: $("#modalRoot"),
     toastRoot: $("#toastRoot"),
   };
@@ -3096,7 +4229,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
         </div>
         <form id="promptForm" novalidate>
           <label class="field"><span>名称</span><input class="input" id="promptName" maxlength="80" value="${escapeHtml(prompt?.name || "")}" placeholder="例如：教学辅助" required></label>
-          <label class="field"><span>系统提示词</span><textarea class="modal-textarea prompt-textarea" id="promptContent" maxlength="30000" placeholder="输入提示词内容…" required>${escapeHtml(prompt?.content || "")}</textarea></label>
+          <label class="field"><span>系统提示词</span><textarea class="modal-textarea prompt-textarea" id="promptContent" maxlength="30000" placeholder="可以完全留空">${escapeHtml(prompt?.content || "")}</textarea></label>
           <div class="form-error hidden" id="promptFormError"></div>
           <div class="modal-actions">
             <button class="secondary-btn" type="button" data-modal-close>取消</button>
@@ -3111,8 +4244,8 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       const submit = $("#promptSubmit", form);
       const name = $("#promptName", form).value.trim();
       const content = $("#promptContent", form).value.trim();
-      if (!name || !content) {
-        errorBox.textContent = "名称和提示词内容都不能为空。";
+      if (!name) {
+        errorBox.textContent = "提示词名称不能为空。";
         errorBox.classList.remove("hidden");
         return;
       }
@@ -3211,7 +4344,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
           ${builtin}
           ${active ? '<span class="prompt-active-mark">新对话默认</span>' : ""}
         </div>
-        <div class="prompt-preview">${escapeHtml(prompt.content)}</div>
+        <div class="prompt-preview">${prompt.content ? escapeHtml(prompt.content) : "（空提示词）"}</div>
         <div class="prompt-card-actions">
           <button class="secondary-btn" type="button" data-prompt-action="edit">编辑</button>
           <button class="secondary-btn" type="button" data-prompt-action="default"${active ? " disabled" : ""}>设为默认</button>
@@ -3222,19 +4355,240 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   }
 
   function renderPromptPicker() {
-    const visible = !state.currentId && state.messages.length === 0;
-    el.promptPicker?.classList.toggle("hidden", !visible);
+    const editable = !state.currentId && state.messages.length === 0;
+    el.promptPickerShell?.classList.toggle("hidden", !editable);
     if (!el.promptPicker) return;
     el.promptPicker.innerHTML = state.prompts.map((prompt) => (
       `<option value="${escapeHtml(prompt.id)}"${prompt.id === state.promptSelection ? " selected" : ""}>${escapeHtml(prompt.name)}</option>`
     )).join("");
-    el.promptPicker.disabled = !visible || !state.prompts.length;
+    el.promptPicker.disabled = !editable || !state.prompts.length;
+    if (el.promptLock) {
+      el.promptLock.classList.toggle("hidden", editable);
+      if (!editable) {
+        const selected = state.prompts.find((prompt) => prompt.id === state.promptSelection);
+        const name = state.current?.prompt_name || selected?.name || "已锁定";
+        el.promptLockName.textContent = name;
+        el.promptLock.title = state.current?.system_prompt || selected?.content || name;
+      }
+      // A brand-new local conversation shows the picker and has not locked anything yet.
+    }
+  }
+
+  async function loadMemory(options = {}) {
+    try {
+      const data = await api("/api/memory");
+      state.memorySettings = {
+        enabled: Boolean(data.enabled),
+        provider_id: data.provider_id || "",
+        model_id: data.model_id || "",
+        review_prompt: data.review_prompt || data.default_review_prompt || "",
+        default_review_prompt: data.default_review_prompt || "",
+      };
+      state.memoryData = {
+        profile: data.profile || "",
+        profile_limit: Number(data.profile_limit) || 2500,
+        conversations: data.conversations || [],
+        retry_count: Number(data.retry_count) || 0,
+        updated_at: data.updated_at || null,
+      };
+      renderMemorySettings();
+      return data;
+    } catch (error) {
+      if (!options.silent) toast(error.message, "error");
+      return null;
+    }
+  }
+
+  function populateMemoryModels(preferredProvider = "", preferredModel = "") {
+    if (!el.memoryProviderSelect || !el.memoryModelSelect) return;
+    const currentProvider = preferredProvider || el.memoryProviderSelect.value || "";
+    el.memoryProviderSelect.innerHTML = '<option value="">选择供应商</option>' + state.providers.map((provider) => (
+      '<option value="' + escapeHtml(provider.id) + '">' + escapeHtml(provider.name) + '</option>'
+    )).join("");
+    if (state.providers.some((provider) => provider.id === currentProvider)) {
+      el.memoryProviderSelect.value = currentProvider;
+    }
+    const provider = state.providers.find((item) => item.id === el.memoryProviderSelect.value);
+    const models = provider ? (provider.models || []) : [];
+    const currentModel = preferredModel || el.memoryModelSelect.value || "";
+    el.memoryModelSelect.innerHTML = '<option value="">选择模型</option>' + models.map((model) => (
+      '<option value="' + escapeHtml(model.id) + '">' + escapeHtml(model.name && model.name !== model.id ? model.name + " · " + model.id : model.id) + '</option>'
+    )).join("");
+    if (models.some((model) => model.id === currentModel)) {
+      el.memoryModelSelect.value = currentModel;
+    }
+  }
+
+  function updateMemoryProfileCount() {
+    if (!el.memoryProfile || !el.memoryProfileCount) return;
+    const length = el.memoryProfile.value.length;
+    const limit = Number(state.memoryData.profile_limit) || 2500;
+    const overLimit = length > limit;
+    el.memoryProfileCount.textContent = length + " / " + limit + " 字" + (overLimit ? "，请缩短" : "");
+    el.memoryProfileCount.classList?.toggle("over-limit", overLimit);
+    if (el.saveMemoryProfileBtn) el.saveMemoryProfileBtn.disabled = overLimit;
+  }
+
+  function renderMemorySettings() {
+    if (!el.memoryEnabledToggle) return;
+    el.memoryEnabledToggle.checked = Boolean(state.memorySettings.enabled);
+    if (el.memoryReviewPrompt) {
+      el.memoryReviewPrompt.value = state.memorySettings.review_prompt || state.memorySettings.default_review_prompt || "";
+    }
+    populateMemoryModels(state.memorySettings.provider_id, state.memorySettings.model_id);
+    const profile = state.memoryData.profile || "";
+    const profileLimit = Number(state.memoryData.profile_limit) || 2500;
+    el.memoryProfile.value = profile;
+    el.memoryProfile.maxLength = profileLimit;
+    updateMemoryProfileCount();
+    const entries = [...(state.memoryData.conversations || [])].sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+    el.memoryIndexCount.textContent = entries.length + " 条";
+    el.memoryIndexList.innerHTML = entries.length
+      ? entries.map((item) => {
+          const archived = item.archived ? " · 已归档" : "";
+          return '<div class="memory-index-item"><div class="memory-index-title">' + escapeHtml(item.title || "对话") + '</div><div class="memory-index-summary">' + escapeHtml(item.summary || "暂无摘要") + '</div><div class="memory-index-meta">ID ' + escapeHtml(item.id || "") + ' · ' + escapeHtml(String(item.turns || 0)) + ' 轮' + archived + '</div><div class="memory-index-actions"><button class="secondary-btn" type="button" data-index-action="edit" data-index-id="' + escapeHtml(item.id || "") + '">编辑</button><button class="secondary-btn danger-btn" type="button" data-index-action="delete" data-index-id="' + escapeHtml(item.id || "") + '">删除索引</button></div></div>';
+        }).join("")
+      : '<div class="memory-index-empty">暂无对话索引。新对话结束后会逐步建立。</div>';
+    el.memoryRetryInfo.textContent = state.memoryData.retry_count
+      ? '待重试：' + state.memoryData.retry_count + ' 条。失败任务会保留并在下次检查时继续重试。'
+      : '';
+  }
+
+  async function saveMemoryProfile() {
+    el.saveMemoryProfileBtn.disabled = true;
+    try {
+      const data = await api("/api/memory/profile", {
+        method: "POST",
+        body: { profile: el.memoryProfile.value },
+      });
+      state.memoryData.profile = data.profile || "";
+      el.memoryProfile.value = data.profile || "";
+      updateMemoryProfileCount();
+      toast("用户画像已保存");
+    } catch (error) {
+      toast(error.message, "error");
+      updateMemoryProfileCount();
+    }
+  }
+
+  function editMemoryIndex(convId) {
+    const item = (state.memoryData.conversations || []).find((entry) => entry.id === convId);
+    if (!item) {
+      toast("记忆索引不存在", "error");
+      return;
+    }
+    showModal(`
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="memoryIndexEditTitle">
+        <div class="modal-head">
+          <div>
+            <h2 class="modal-title" id="memoryIndexEditTitle">编辑记忆索引</h2>
+            <p class="modal-subtitle">内部 ID 保持不变：${escapeHtml(item.id || "")}</p>
+          </div>
+          <button class="modal-close" type="button" data-modal-close aria-label="关闭">${icon("i-close")}</button>
+        </div>
+        <div class="memory-index-sync-title">索引标题跟随对话：<strong>${escapeHtml(item.title || "对话")}</strong></div>
+        <label class="field"><span>索引摘要 <small id="memoryIndexSummaryCount"></small></span><textarea class="modal-textarea memory-index-textarea" id="memoryIndexSummary" maxlength="300" spellcheck="false">${escapeHtml(item.summary || "")}</textarea></label>
+        <label class="field"><span>关键词 <small>用逗号分隔</small></span><input class="input" id="memoryIndexKeywords" maxlength="400" value="${escapeHtml((item.keywords || []).join("，"))}"></label>
+        <div class="form-error hidden" id="memoryIndexError"></div>
+        <div class="modal-actions">
+          <button class="secondary-btn" type="button" data-modal-close>取消</button>
+          <button class="primary-btn" id="saveMemoryIndexBtn" type="button">保存索引</button>
+        </div>
+      </div>`);
+    const summaryInput = $("#memoryIndexSummary", el.modalRoot);
+    const keywordsInput = $("#memoryIndexKeywords", el.modalRoot);
+    const summaryCount = $("#memoryIndexSummaryCount", el.modalRoot);
+    const errorBox = $("#memoryIndexError", el.modalRoot);
+    const saveIndexButton = $("#saveMemoryIndexBtn", el.modalRoot);
+    const updateSummaryCount = () => {
+      const overLimit = summaryInput.value.length > 300;
+      summaryCount.textContent = summaryInput.value.length + " / 300 字" + (overLimit ? "，请压缩" : "");
+      summaryCount.classList?.toggle("over-limit", overLimit);
+      saveIndexButton.disabled = overLimit;
+    };
+    summaryInput.addEventListener("input", updateSummaryCount);
+    updateSummaryCount();
+    saveIndexButton.addEventListener("click", async () => {
+      const summary = summaryInput.value.trim();
+      if (!summary) {
+        errorBox.textContent = "索引摘要不能为空。";
+        errorBox.classList.remove("hidden");
+        return;
+      }
+      const button = saveIndexButton;
+      button.disabled = true;
+      errorBox.classList.add("hidden");
+      try {
+        await api(`/api/memory/index/${encodeURIComponent(convId)}`, {
+          method: "POST",
+          body: { summary, keywords: keywordsInput.value },
+        });
+        closeModal();
+        await loadMemory({ silent: true });
+        toast("记忆索引已保存");
+      } catch (error) {
+        errorBox.textContent = error.message;
+        errorBox.classList.remove("hidden");
+        button.disabled = false;
+      }
+    });
+  }
+
+  async function deleteMemoryIndex(convId) {
+    const item = (state.memoryData.conversations || []).find((entry) => entry.id === convId);
+    const confirmed = await confirmDialog(
+      "删除记忆索引",
+      `确定永久排除 <strong>${escapeHtml(item?.title || "这条对话")}</strong> 吗？它会从当前索引移除，已有快照保持不变，并且以后不会进入新对话的记忆快照。`,
+      "删除索引",
+    );
+    if (!confirmed) return;
+    try {
+      await api(`/api/memory/index/${encodeURIComponent(convId)}`, { method: "DELETE" });
+      await loadMemory({ silent: true });
+      toast("记忆索引已删除");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function saveMemorySettings() {
+    el.saveMemorySettingsBtn.disabled = true;
+    try {
+      const data = await api("/api/memory", {
+        method: "POST",
+        body: {
+          enabled: Boolean(el.memoryEnabledToggle.checked),
+          provider_id: el.memoryProviderSelect.value,
+          model_id: el.memoryModelSelect.value,
+          review_prompt: el.memoryReviewPrompt.value,
+        },
+      });
+      state.memorySettings = { ...state.memorySettings, ...(data.memory || {}) };
+      await loadMemory({ silent: true });
+      toast("记忆设置已保存");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      el.saveMemorySettingsBtn.disabled = false;
+    }
+  }
+
+  async function scanMemory() {
+    el.scanMemoryBtn.disabled = true;
+    try {
+      const data = await api("/api/memory/scan", { method: "POST", body: {} });
+      toast(data.started ? "已开始检查可更新的对话" : "记忆检查已在运行");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      el.scanMemoryBtn.disabled = false;
+    }
   }
 
   async function loadWebSettings(options = {}) {
     try {
       const data = await api("/api/settings");
-      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 5, ...(data.web || {}) };
+      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 10, ...(data.web || {}) };
       const savedWeb = store.get("xxh.webSearch", "");
       if (!state.webSettings.enabled || !state.webSettings.configured) {
         state.webSearchEnabled = false;
@@ -3260,7 +4614,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     el.firecrawlKeyHint.textContent = state.webSettings.configured
       ? "已保存本地 Key，只写入 config.json，不会发送给模型。"
       : "请填写 Firecrawl API Key 后再启用联网搜索。";
-    el.webMaxResults.value = String(state.webSettings.max_results || 5);
+    el.webMaxResults.value = String(state.webSettings.max_results || 10);
     updateWebSearchButton();
   }
 
@@ -3295,14 +4649,14 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   async function saveWebSettings() {
     const enabled = Boolean(el.webEnabledToggle.checked);
     const apiKey = el.firecrawlKey.value.trim();
-    const maxResults = Number(el.webMaxResults.value) || 5;
+    const maxResults = Math.max(1, Math.min(50, Number(el.webMaxResults.value) || 10));
     el.saveWebSettingsBtn.disabled = true;
     try {
       const data = await api("/api/settings/web", {
         method: "POST",
         body: { enabled, api_key: apiKey, max_results: maxResults },
       });
-      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 5, ...(data.web || {}) };
+      state.webSettings = { enabled: false, configured: false, key_hint: "", max_results: 10, ...(data.web || {}) };
       const savedWeb = store.get("xxh.webSearch", "");
       if (!state.webSettings.enabled || !state.webSettings.configured) {
         state.webSearchEnabled = false;
@@ -3877,17 +5231,41 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     }
   }
 
+  function normalizeFontSize(value) {
+    const legacy = { small: 90, normal: 100, large: 110, xlarge: 120 };
+    const raw = legacy[value] ?? Number(value);
+    const safe = Number.isFinite(raw) ? raw : 100;
+    return Math.max(80, Math.min(140, Math.round(safe / 10) * 10));
+  }
+
+  function applyFontSize(value) {
+    const next = normalizeFontSize(value);
+    state.fontSize = next;
+    document.documentElement.style.setProperty("--reading-font-scale", String(next / 100));
+    store.set(STORE_KEYS.fontSize, String(next));
+    if (el.generalFontValue) el.generalFontValue.textContent = next + "%";
+    if (el.generalFontMinus) el.generalFontMinus.disabled = next <= 80;
+    if (el.generalFontPlus) el.generalFontPlus.disabled = next >= 140;
+  }
+
+  function loadGeneralSettings() {
+    applyFontSize(store.get(STORE_KEYS.fontSize, "100"));
+  }
+
   function setSettingsTab(tab) {
-    const next = ["models", "prompts", "web", "archive"].includes(tab) ? tab : "models";
+    const next = ["general", "models", "prompts", "memory", "web", "archive"].includes(tab) ? tab : "models";
     state.settingsTab = next;
     $$("[data-settings-tab]", el.settingsTabs).forEach((button) => {
       button.classList.toggle("active", button.getAttribute("data-settings-tab") === next);
     });
+    el.generalSettingsPanel.classList.toggle("hidden", next !== "general");
     el.modelSettingsPanel.classList.toggle("hidden", next !== "models");
     el.promptSettingsPanel.classList.toggle("hidden", next !== "prompts");
+    el.memorySettingsPanel.classList.toggle("hidden", next !== "memory");
     el.webSettingsPanel.classList.toggle("hidden", next !== "web");
     el.archiveSettingsPanel.classList.toggle("hidden", next !== "archive");
     if (next === "prompts") loadPrompts();
+    if (next === "memory") loadMemory({ silent: true });
     if (next === "web") loadWebSettings();
     if (next === "archive") loadArchivedConversations({ silent: true });
   }
@@ -3956,6 +5334,66 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     });
   }
 
+  function openChatSearch() {
+    showModal(`
+      <div class="modal chat-search-modal" role="dialog" aria-modal="true" aria-labelledby="chatSearchTitle">
+        <div class="modal-head">
+          <div>
+            <h2 class="modal-title" id="chatSearchTitle">搜索历史对话</h2>
+            <p class="modal-subtitle">同时搜索标题、用户消息、回答和附件文字，包含已归档对话。</p>
+          </div>
+          <button class="modal-close" type="button" data-modal-close aria-label="关闭">${icon("i-close")}</button>
+        </div>
+        <label class="field"><span>关键词</span><input class="input" id="chatSearchInput" maxlength="200" autocomplete="off" placeholder="输入标题或原文关键词…"></label>
+        <div class="chat-search-results" id="chatSearchResults"><div class="memory-index-empty">输入关键词开始搜索。</div></div>
+      </div>`);
+    const input = $("#chatSearchInput", el.modalRoot);
+    const results = $("#chatSearchResults", el.modalRoot);
+    let timer = null;
+    let sequence = 0;
+    const runSearch = async () => {
+      const query = input.value.trim();
+      const current = ++sequence;
+      if (!query) {
+        results.innerHTML = '<div class="memory-index-empty">输入关键词开始搜索。</div>';
+        return;
+      }
+      results.innerHTML = '<div class="memory-index-empty">正在搜索…</div>';
+      try {
+        const data = await api(`/api/conversations/search?q=${encodeURIComponent(query)}`);
+        if (current !== sequence) return;
+        const items = data.results || [];
+        results.innerHTML = items.length
+          ? items.map((item) => `<button class="chat-search-result" type="button" data-search-open="${escapeHtml(item.id)}" data-search-archived="${item.archived ? "1" : "0"}"><span class="chat-search-result-head"><strong>${escapeHtml(item.title || "对话")}</strong><small>${escapeHtml(item.match_type || "")}${item.archived ? " · 已归档" : ""}</small></span><span class="chat-search-result-snippet">${escapeHtml(item.snippet || "")}</span></button>`).join("")
+          : '<div class="memory-index-empty">没有找到匹配的对话。</div>';
+      } catch (error) {
+        if (current === sequence) results.innerHTML = `<div class="form-error">${escapeHtml(error.message)}</div>`;
+      }
+    };
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = window.setTimeout(runSearch, 180);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        clearTimeout(timer);
+        runSearch();
+      }
+    });
+    results.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-search-open]");
+      if (!button) return;
+      const convId = button.getAttribute("data-search-open") || "";
+      if (!convId) return;
+      const archived = button.getAttribute("data-search-archived") === "1";
+      closeModal();
+      openConversation(convId);
+      if (archived) toast("该对话已归档，可以查看但不能继续提问");
+    });
+    window.setTimeout(() => input.focus(), 30);
+  }
+
   async function openConversation(convId) {
     state.autoScroll = true;
     state.lastScrollTop = 0;
@@ -4014,6 +5452,9 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     renderMessages();
     renderHistory();
     closeMobileSidebar();
+    if (state.memorySettings.enabled) {
+      api("/api/memory/scan", { method: "POST", body: {} }).catch(() => {});
+    }
     el.composerInput.focus();
   }
 
@@ -4393,8 +5834,50 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     return out;
   }
 
+  function repairLatexBraces(text) {
+    let value = String(text);
+    let depth = 0;
+    let out = "";
+    for (let i = 0; i < value.length; i += 1) {
+      const ch = value[i];
+      if (ch === "\\") {
+        out += ch;
+        if (i + 1 < value.length) { out += value[i + 1]; i += 1; }
+        continue;
+      }
+      if (ch === "{") { depth += 1; out += ch; continue; }
+      if (ch === "}") {
+        if (depth === 0) continue; // Drop a stray closing brace that would break the whole formula.
+        depth -= 1; out += ch; continue;
+      }
+      out += ch;
+    }
+    if (depth > 0) out += "}".repeat(depth);
+    return out;
+  }
+
+  function stripUnsupportedLatex(text) {
+    let value = String(text);
+    // mhchem is not part of KaTeX core. Render common chemistry as upright text
+    // instead of showing the entire expression as a red KaTeX error.
+    const subDigits = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉" };
+    const supDigits = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹" };
+    const plainChemistry = (inner) => String(inner)
+      .replace(/\s+/g, "")
+      .replace(/[{}]/g, "")
+      .replace(/\\/g, "")
+      .replace(/([A-Za-z)])([0-9]+)/g, (_, token, digits) => token + Array.from(digits).map((ch) => subDigits[ch] || ch).join(""))
+    let previous;
+    do {
+      previous = value;
+      value = value.replace(/\\ce\s*\{([^{}]*)\}/g, (_, inner) => `\\mathrm{${plainChemistry(inner)}}`);
+    } while (value !== previous);
+    return value;
+  }
+
   function renderMath(expr, display) {
-    const text = String(expr).trim();
+    let text = repairLatexBraces(String(expr).trim());
+    if (!window.katex || window.__mhchemLoadFailed) text = stripUnsupportedLatex(text);
     if (window.katex && typeof window.katex.renderToString === "function") {
       try {
         const body = window.katex.renderToString(text, {
@@ -4405,6 +5888,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
           output: "htmlAndMathml",
           errorColor: "#ff8290",
         });
+        if (body.includes("katex-error")) throw new Error("KaTeX could not parse the expression");
         return display
           ? `<div class="math-display">${body}</div>`
           : `<span class="math-inline">${body}</span>`;
@@ -4412,7 +5896,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
         console.warn("KaTeX 渲染失败，改用内置降级渲染器", error);
       }
     }
-    let fallback = text;
+    let fallback = stripUnsupportedLatex(text);
     fallback = fallback.replace(/\\(?:displaystyle|textstyle|limits|nolimits)/g, "");
     fallback = fallback.replace(/\\begin\{[^}]*\}/g, "").replace(/\\end\{[^}]*\}/g, "");
     const body = renderMathExpr(fallback, display);
@@ -4459,7 +5943,67 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     let text = String(line).trim();
     if (text.startsWith("|")) text = text.slice(1);
     if (text.endsWith("|")) text = text.slice(0, -1);
-    return text.split("|").map((cell) => cell.trim());
+    const cells = [];
+    let current = "";
+    let inCode = false;
+    let mathMode = "";
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i];
+      const next = text[i + 1] || "";
+      if (ch === "\\") {
+        if (next === "(") { mathMode = "paren"; current += "\\("; i += 1; continue; }
+        if (next === ")" && mathMode === "paren") { mathMode = ""; current += "\\)"; i += 1; continue; }
+        if (next === "[") { mathMode = "bracket"; current += "\\["; i += 1; continue; }
+        if (next === "]" && mathMode === "bracket") { mathMode = ""; current += "\\]"; i += 1; continue; }
+        if (next === "|") {
+          current += (inCode || mathMode) ? "\\|" : "|";
+          i += 1;
+          continue;
+        }
+        if (next === "\\") { current += "\\\\"; i += 1; continue; }
+        current += ch;
+        continue;
+      }
+      if (ch === "`" && !mathMode) {
+        inCode = !inCode;
+        current += ch;
+        continue;
+      }
+      if (ch === "$" && !inCode) {
+        if (!mathMode && next === "$") {
+          mathMode = "dollar2";
+          current += "$$";
+          i += 1;
+          continue;
+        }
+        if (!mathMode) {
+          mathMode = "dollar";
+          current += ch;
+          continue;
+        }
+        if (mathMode === "dollar") {
+          mathMode = "";
+          current += ch;
+          continue;
+        }
+        if (mathMode === "dollar2" && next === "$") {
+          mathMode = "";
+          current += "$$";
+          i += 1;
+          continue;
+        }
+        current += ch;
+        continue;
+      }
+      if (ch === "|" && !inCode && !mathMode) {
+        cells.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    cells.push(current.trim());
+    return cells;
   }
 
   function isTableSeparator(line) {
@@ -4591,15 +6135,30 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
 
   function renderToolEvents(events) {
     if (!Array.isArray(events) || !events.length) return "";
+    const labels = { web_search: "联网搜索", memory_search: "搜索记忆", memory_read_conversation: "读取历史对话", memory_save: "写入记忆" };
     return events.map((event) => {
+      const name = event.name || "web_search";
+      const label = labels[name] || name;
       const status = event.status === "searching"
-        ? "搜索中…"
+        ? "调用中…"
         : event.status === "error"
-          ? "搜索失败"
-          : `完成 · ${event.result_count || 0} 条`;
+          ? "失败"
+          : name === "web_search"
+            ? `完成 · ${event.result_count || 0} 条`
+            : "完成";
       const cls = event.status === "error" ? " error" : event.status === "searching" ? " searching" : "";
-      return `<div class="tool-event${cls}">${icon("i-globe")}<span class="tool-event-name">联网搜索</span><span class="tool-event-query">${escapeHtml(event.query || "自动判断查询")}</span><span class="tool-event-status">${escapeHtml(status)}</span></div>`;
+      const iconId = name === "web_search" ? "i-globe" : "i-chat";
+      return `<div class="tool-event${cls}">${icon(iconId)}<span class="tool-event-name">${escapeHtml(label)}</span><span class="tool-event-query">${escapeHtml(event.query || "自动判断")}</span><span class="tool-event-status">${escapeHtml(status)}</span></div>`;
     }).join("");
+  }
+
+  function renderSearchSources(sources) {
+    const items = Array.isArray(sources) ? sources : [];
+    if (!items.length) return "";
+    const visible = items.slice(0, 3);
+    const rest = items.slice(3);
+    const link = (source) => `<a href="${escapeHtml(source.url || "#")}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(source.title || source.url || "")}">${escapeHtml(source.title || source.url || "来源")}</a>`;
+    return `<div class="search-sources">${visible.map(link).join("")}${rest.length ? `<details class="source-more"><summary>其余 ${rest.length} 个来源</summary><div class="source-more-list">${rest.map(link).join("")}</div></details>` : ""}</div>`;
   }
 
   function messageHtml(message, options = {}) {
@@ -4646,7 +6205,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
           <div class="tool-events ${Array.isArray(message.tool_events) && message.tool_events.length ? "" : "hidden"}">${renderToolEvents(message.tool_events)}</div>
           <div class="thinking-indicator ${message.streaming && !content ? "" : "hidden"}"><span class="thinking-text">${escapeHtml(message.status || "正在思考")}</span><i></i><i></i><i></i></div>
           <div class="markdown ${message.streaming ? "streaming" : ""} ${content ? "" : "hidden"}">${content ? renderMarkdown(content) : ""}</div>
-          ${Array.isArray(message.search_sources) && message.search_sources.length ? `<div class="search-sources">${message.search_sources.map((source) => `<a href="${escapeHtml(source.url || "#")}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(source.title || source.url || "")}">${escapeHtml(source.title || source.url || "来源")}</a>`).join("")}</div>` : ""}
+          ${renderSearchSources(message.search_sources)}
           ${message.notice ? `<div class="notice-line">${escapeHtml(message.notice)}</div>` : ""}
           ${message.stopped ? `<div class="notice-line">已停止生成</div>` : ""}
           ${message.error ? `<div class="error-box">${escapeHtml(message.error)}</div>` : ""}
@@ -4839,11 +6398,49 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     }).join("");
     updateSendAvailability();
     renderContextBar();
+    renderTurnNav();
     if (state.autoScroll) {
-      requestAnimationFrame(() => {
-        if (state.autoScroll) scrollToBottom(false);
-      });
+      requestAnimationFrame(() => followBottom());
     }
+  }
+
+  function renderTurnNav() {
+    if (!el.turnNav || !el.turnNavList) return;
+    const turns = buildTurns(state.messages);
+    const visible = turns.length > 1;
+    el.turnNav.classList.toggle("hidden", !visible);
+    el.chatPage.classList.toggle("has-turn-nav", visible);
+    el.turnNavCount.textContent = turns.length ? String(turns.length) : "";
+    if (!visible) return;
+    el.turnNavList.innerHTML = turns.map((turn, index) => {
+      const text = String(turn.user.content || "").trim()
+        || (turn.user.images?.length ? "[图片]" : turn.user.files?.length ? "[附件]" : "问题");
+      return `<button class="turn-nav-item" type="button" data-nav-turn="${index}" title="${escapeHtml(text)}"><span class="turn-nav-dot"></span><span class="turn-nav-text">${escapeHtml(text)}</span></button>`;
+    }).join("");
+    syncTurnNav();
+  }
+
+  function scrollTurnIntoView(index) {
+    const turn = el.messageList.querySelector(`[data-turn-index="${index}"]`);
+    if (!turn) return;
+    pauseAutoScroll(1200);
+    const node = el.chatScroll;
+    const top = turn.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop - 12;
+    node.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  }
+
+  function syncTurnNav() {
+    if (!el.turnNavList || el.turnNav.classList.contains("hidden")) return;
+    const node = el.chatScroll;
+    const top = node.getBoundingClientRect().top + 28;
+    const items = Array.from(el.turnNavList.querySelectorAll("[data-nav-turn]"));
+    let active = 0;
+    for (const item of items) {
+      const index = Number(item.getAttribute("data-nav-turn"));
+      const turn = el.messageList.querySelector(`[data-turn-index="${index}"]`);
+      if (turn && turn.getBoundingClientRect().top <= top) active = index;
+    }
+    items.forEach((item) => item.classList.toggle("active", Number(item.getAttribute("data-nav-turn")) === active));
   }
 
   const STICK_THRESHOLD = 120;
@@ -4860,20 +6457,48 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     const top = node.scrollTop;
     const delta = top - state.lastScrollTop;
     state.lastScrollTop = top;
-    if (isNearBottom()) state.autoScroll = true;
-    else if (delta < -2) state.autoScroll = false;
+    if (delta < -2) {
+      pauseAutoScroll();
+    } else if (delta > 0 && isNearBottom() && performance.now() >= state.scrollPauseUntil) {
+      state.autoScroll = true;
+    }
     el.jumpWrap.classList.toggle("hidden", state.autoScroll && isNearBottom());
+    syncTurnNav();
+  }
+
+  function pauseAutoScroll(durationMs = 1200) {
+    state.autoScroll = false;
+    state.scrollPauseUntil = performance.now() + durationMs;
+    el.jumpWrap.classList.remove("hidden");
+  }
+
+  function followBottom() {
+    if (!state.autoScroll || performance.now() < state.scrollPauseUntil) return;
+    const node = el.chatScroll;
+    node.scrollTop = node.scrollHeight;
+  }
+
+  function followStreamingRow(row) {
+    if (!state.autoScroll || performance.now() < state.scrollPauseUntil) return;
+    const node = el.chatScroll;
+    const rowTop = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
+    if (rowTop <= 8) {
+      pauseAutoScroll(0);
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
   }
 
   function scrollToBottom(smooth = true) {
     const node = el.chatScroll;
     state.autoScroll = true;
+    state.scrollPauseUntil = 0;
     el.jumpWrap.classList.add("hidden");
     node.scrollTo({ top: node.scrollHeight, behavior: smooth ? "smooth" : "instant" });
   }
 
   function stickToBottomIfFollowing() {
-    if (state.autoScroll) scrollToBottom(false);
+    followBottom();
   }
 
   function updateStreamingAssistant(message) {
@@ -4926,7 +6551,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       }
       notice.textContent = message.notice;
     }
-    if (state.autoScroll) scrollToBottom(false);
+    followStreamingRow(row);
   }
 
   function queueStreamRender(message) {
@@ -5056,17 +6681,19 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   async function addImageFiles(fileList) {
     const files = Array.from(fileList || []).filter((file) => file.type && file.type.startsWith("image/"));
     if (!files.length) return;
-    const room = MAX_IMAGES - state.attachments.length;
-    if (room <= 0) {
-      toast(`最多发送 ${MAX_IMAGES} 张图片`, "error");
-      return;
-    }
-    if (files.length > room) toast(`最多 ${MAX_IMAGES} 张图片，已忽略多余部分`, "error");
     el.attachBtn.disabled = true;
     try {
-      for (const file of files.slice(0, room)) {
+      for (const file of files) {
         try {
           const dataUrl = await compressImage(file);
+          const projectedTokens = localContextTokens()
+            + pendingAttachmentTokens()
+            + estimateTextTokens(el.composerInput.value || "")
+            + IMAGE_TOKEN_ESTIMATE;
+          if (projectedTokens > contextLimit()) {
+            toast(`${file.name} 加入后会超出当前模型上下文，已跳过`, "error");
+            continue;
+          }
           state.attachments.push(dataUrl);
           renderAttachments();
         } catch (error) {
@@ -5100,6 +6727,20 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     return data.file;
   }
 
+  function pendingAttachmentTokens() {
+    let total = 0;
+    total += (state.attachments || []).length * IMAGE_TOKEN_ESTIMATE;
+    for (const file of state.fileAttachments || []) {
+      total += estimateTextTokens(file.text || "");
+      total += (file.page_images || []).length * IMAGE_TOKEN_ESTIMATE;
+    }
+    return total;
+  }
+
+  function fileAttachmentTokens(file) {
+    return estimateTextTokens(file?.text || "") + (file?.page_images || []).length * IMAGE_TOKEN_ESTIMATE;
+  }
+
   async function addFileAttachments(fileList) {
     const candidates = Array.from(fileList || []);
     const files = candidates.filter((file) => /\.(pdf|docx?|txt|md|markdown|csv|json)$/i.test(file.name));
@@ -5107,42 +6748,21 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       if (candidates.length) toast("只支持 PDF、DOC/DOCX 和文本文件", "error");
       return;
     }
-    const room = MAX_FILES - state.fileAttachments.length;
-    if (room <= 0) {
-      toast(`最多发送 ${MAX_FILES} 个文件`, "error");
-      return;
-    }
-    if (files.length > room) toast(`最多 ${MAX_FILES} 个文件，已忽略多余部分`, "error");
     el.fileBtn.disabled = true;
     try {
-      for (const file of files.slice(0, room)) {
+      for (const file of files) {
         try {
           toast(`正在读取 ${file.name}…`, "success", 1800);
           const extracted = await extractFileAttachment(file);
-          const currentImages = state.fileAttachments.reduce(
-            (total, item) => total + (Array.isArray(item.page_images) ? item.page_images.length : 0),
-            0,
-          );
-          const currentImageChars = state.fileAttachments.reduce(
-            (total, item) => total + (Array.isArray(item.page_images)
-              ? item.page_images.reduce((sum, image) => sum + String(image.data_url || "").length, 0)
-              : 0),
-            0,
-          );
           const sourceImages = Array.isArray(extracted.page_images) ? extracted.page_images : [];
-          const selectedImages = [];
-          let imageChars = currentImageChars;
-          for (const image of sourceImages) {
-            if (selectedImages.length >= Math.max(0, MAX_DOCUMENT_IMAGES - currentImages)) break;
-            const imageLength = String(image.data_url || "").length;
-            if (imageChars + imageLength > MAX_DOCUMENT_IMAGE_CHARS) break;
-            selectedImages.push(image);
-            imageChars += imageLength;
-          }
-          if (selectedImages.length !== sourceImages.length) {
-            extracted.page_images = selectedImages;
-            extracted.images_truncated = true;
-            toast(`${extracted.name} 的页面图片过多，已截断`, "error");
+          extracted.page_images = sourceImages;
+          const projectedTokens = localContextTokens()
+            + pendingAttachmentTokens()
+            + estimateTextTokens(el.composerInput.value || "")
+            + fileAttachmentTokens(extracted);
+          if (projectedTokens > contextLimit()) {
+            toast(`${extracted.name} 加入后会超出当前模型上下文，已跳过`, "error");
+            continue;
           }
           state.fileAttachments.push(extracted);
           renderAttachments();
@@ -5159,7 +6779,7 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   function renderAttachments() {
     const images = state.attachments.map((url, index) => `
       <div class="attachment-item">
-        <img src="${escapeHtml(url)}" alt="待发送图片 ${index + 1}">
+        <img src="${escapeHtml(url)}" alt="待发送图片 ${index + 1}" data-preview-src="${escapeHtml(url)}" title="滚轮放大">
         <button class="attachment-remove" type="button" data-remove-image="${index}" aria-label="移除图片">${icon("i-close")}</button>
       </div>`).join("");
     const files = state.fileAttachments.map((file, index) => `
@@ -5184,8 +6804,73 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     showModal(`
       <div class="image-viewer" role="dialog" aria-modal="true">
         <button class="image-viewer-close" type="button" data-modal-close aria-label="关闭">${icon("i-close")}</button>
-        <img src="${escapeHtml(url)}" alt="图片预览">
+        <img src="${escapeHtml(url)}" alt="图片预览" draggable="false">
+        <div class="image-viewer-hint">滚轮缩放 · 拖拽平移 · 双击重置</div>
       </div>`);
+    const viewer = el.modalRoot.querySelector(".image-viewer");
+    const img = viewer?.querySelector("img");
+    if (!viewer || !img) return;
+    let scale = 1;
+    let tx = 0;
+    let ty = 0;
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let originX = 0;
+    let originY = 0;
+    const apply = () => {
+      img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      viewer.classList.toggle("zoomed", scale > 1.01);
+    };
+    const clampScale = (value) => Math.max(0.35, Math.min(6, value));
+    const reset = () => {
+      scale = 1;
+      tx = 0;
+      ty = 0;
+      apply();
+    };
+    viewer.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const next = clampScale(scale * Math.exp(-event.deltaY * 0.0015));
+      if (Math.abs(next - scale) < 0.0005) return;
+      const rect = img.getBoundingClientRect();
+      const cx = event.clientX - (rect.left + rect.width / 2);
+      const cy = event.clientY - (rect.top + rect.height / 2);
+      tx = cx - (cx - tx) * (next / scale);
+      ty = cy - (cy - ty) * (next / scale);
+      scale = next;
+      if (scale <= 1.01) { tx = 0; ty = 0; }
+      apply();
+    }, { passive: false });
+    img.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      reset();
+    });
+    img.addEventListener("pointerdown", (event) => {
+      if (scale <= 1.01) return;
+      event.preventDefault();
+      dragging = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      originX = tx;
+      originY = ty;
+      viewer.classList.add("dragging");
+      img.setPointerCapture?.(event.pointerId);
+    });
+    img.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      tx = originX + event.clientX - startX;
+      ty = originY + event.clientY - startY;
+      apply();
+    });
+    const endDrag = () => {
+      dragging = false;
+      viewer.classList.remove("dragging");
+    };
+    img.addEventListener("pointerup", endDrag);
+    img.addEventListener("pointercancel", endDrag);
+    img.addEventListener("pointerleave", () => { if (dragging) endDrag(); });
+    apply();
   }
 
   function viewFile(file) {
@@ -5671,6 +7356,10 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     el.chatScroll.addEventListener("scroll", () => {
       syncAutoScroll();
     }, { passive: true });
+    el.chatScroll.addEventListener("wheel", (event) => {
+      if (event.deltaY < 0) pauseAutoScroll(1200);
+    }, { passive: true });
+    el.chatScroll.addEventListener("touchmove", () => pauseAutoScroll(1200), { passive: true });
     el.jumpBtn.addEventListener("click", () => scrollToBottom(false));
     el.compressBtn.addEventListener("click", compressContext);
     el.navChat.addEventListener("click", () => setRoute("chat"));
@@ -5679,8 +7368,32 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     el.menuBtn.addEventListener("click", openMobileSidebar);
     el.mobileBackdrop.addEventListener("click", closeMobileSidebar);
 
+    el.generalFontMinus.addEventListener("click", () => applyFontSize(state.fontSize - 10));
+    el.generalFontPlus.addEventListener("click", () => applyFontSize(state.fontSize + 10));
+    el.resetGeneralSettingsBtn.addEventListener("click", () => {
+      applyFontSize(100);
+      toast("已恢复默认字体大小");
+    });
     el.addProviderBtn.addEventListener("click", () => openProviderModal());
     el.saveWebSettingsBtn.addEventListener("click", saveWebSettings);
+    el.saveMemorySettingsBtn.addEventListener("click", saveMemorySettings);
+    el.resetMemoryPromptBtn.addEventListener("click", () => {
+      el.memoryReviewPrompt.value = state.memorySettings.default_review_prompt || "";
+      toast("已恢复默认提示词，点击“保存记忆设置”后生效");
+    });
+    el.saveMemoryProfileBtn.addEventListener("click", saveMemoryProfile);
+    el.memoryProfile.addEventListener("input", updateMemoryProfileCount);
+    el.scanMemoryBtn.addEventListener("click", scanMemory);
+    el.refreshMemoryBtn.addEventListener("click", () => loadMemory());
+    el.memoryProviderSelect.addEventListener("change", () => populateMemoryModels(el.memoryProviderSelect.value, ""));
+    el.memoryIndexList.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-index-action]");
+      if (!action) return;
+      const convId = action.getAttribute("data-index-id") || "";
+      if (!convId) return;
+      if (action.getAttribute("data-index-action") === "edit") editMemoryIndex(convId);
+      else deleteMemoryIndex(convId);
+    });
     el.addPromptBtn.addEventListener("click", () => openPromptModal());
     el.promptList.addEventListener("click", (event) => {
       const action = event.target.closest("[data-prompt-action]");
@@ -5715,6 +7428,11 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
       else deleteProvider(provider);
     });
 
+    el.chatSearchBtn.addEventListener("click", openChatSearch);
+    el.turnNavList.addEventListener("click", (event) => {
+      const item = event.target.closest("[data-nav-turn]");
+      if (item) scrollTurnIntoView(Number(item.getAttribute("data-nav-turn")));
+    });
     el.historyList.addEventListener("click", (event) => {
       const rename = event.target.closest("[data-rename-conv]");
       if (rename) {
@@ -5799,11 +7517,16 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
         if (file) viewFile(file);
         return;
       }
-      const view = event.target.closest("[data-view-image]");
+      const view = event.target.closest("[data-view-image], [data-view-file-image]");
       if (view) {
         const uid = view.getAttribute("data-view-uid");
         const message = state.messages.find((item) => item.uid === uid);
-        const url = message?.images?.[Number(view.getAttribute("data-view-image"))];
+        const imageIndex = view.hasAttribute("data-view-image") ? Number(view.getAttribute("data-view-image")) : null;
+        const fileIndex = view.hasAttribute("data-view-file-image") ? Number(view.getAttribute("data-view-file-image")) : null;
+        const file = fileIndex !== null ? message?.files?.[fileIndex] : null;
+        const url = imageIndex !== null
+          ? message?.images?.[imageIndex]
+          : file?.page_images?.[Number(view.getAttribute("data-page-image"))]?.data_url;
         if (url) viewImage(url);
         return;
       }
@@ -5829,6 +7552,11 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
     el.stopBtn.addEventListener("click", stopStreaming);
 
     el.attachmentStrip.addEventListener("click", (event) => {
+      const preview = event.target.closest("[data-preview-src]");
+      if (preview) {
+        viewImage(preview.getAttribute("data-preview-src") || "");
+        return;
+      }
       const removeImage = event.target.closest("[data-remove-image]");
       if (removeImage) {
         state.attachments.splice(Number(removeImage.getAttribute("data-remove-image")), 1);
@@ -5866,12 +7594,14 @@ if (!window.katex) document.write('<script src="https://cdn.bootcdn.net/ajax/lib
   }
 
   async function init() {
+    loadGeneralSettings();
     state.webSearchEnabled = store.get("xxh.webSearch", "") === "1";
     setRoute(window.location.hash === "#settings" ? "settings" : "chat", false);
     setupComposer();
     bindEvents();
     renderMessages();
     await Promise.all([loadProviders(), loadPrompts(), loadWebSettings({ silent: true })]);
+    await loadMemory({ silent: true });
     await Promise.all([
       loadConversations(),
       loadArchivedConversations({ silent: true }),
@@ -6009,6 +7739,49 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if path == "/api/memory":
+                config = load_config()
+                conversations = load_conversations()
+                memory = sync_memory_entries(load_memory(), conversations)
+                settings = (config.get("settings") or {}).get("memory") or {}
+                reviews = memory.get("reviews") or {}
+                snapshots = [
+                    memory_snapshot_summary(conv)
+                    for conv in conversations
+                    if conv.get("memory_snapshot") or conv.get("memory_snapshot_manual")
+                ]
+                retry_count = sum(
+                    1 for conv in conversations
+                    if not conv.get("archived")
+                    and int((reviews.get(str(conv.get("id") or "")) or {}).get("failures") or 0) > 0
+                )
+                self._send_json({
+                    "enabled": bool(settings.get("enabled")),
+                    "provider_id": settings.get("provider_id") or "",
+                    "model_id": settings.get("model_id") or "",
+                    "review_prompt": settings.get("review_prompt") or MEMORY_REVIEW_SYSTEM,
+                    "default_review_prompt": MEMORY_REVIEW_SYSTEM,
+                    "profile": memory.get("profile") or "",
+                    "profile_limit": PROFILE_MAX_CHARS,
+                    "conversations": [item for item in (memory.get("conversations") or []) if _entry_is_meaningful(item)],
+                    "snapshots": snapshots,
+                    "retry_count": retry_count,
+                    "updated_at": memory.get("updated_at"),
+                })
+                return
+            snapshot_match = re.fullmatch(r"/api/memory/snapshots/([^/]+)", path)
+            if snapshot_match:
+                conv_id = unquote(snapshot_match.group(1))
+                with FILE_LOCK:
+                    conversations = load_conversations()
+                conv = next((item for item in conversations if item.get("id") == conv_id), None)
+                if conv is None:
+                    raise ApiError("对话不存在", 404)
+                result = memory_snapshot_summary(conv)
+                result["snapshot"] = str(conv.get("memory_snapshot") or "")
+                result["limit"] = MEMORY_SNAPSHOT_EDIT_MAX_CHARS
+                self._send_json({"snapshot": result})
+                return
             if path == "/api/settings":
                 config = load_config()
                 web = (config.get("settings") or {}).get("web") or {}
@@ -6018,19 +7791,31 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "enabled": bool(web.get("enabled")),
                         "configured": bool(key),
                         "key_hint": ("••••" + key[-4:]) if key else "",
-                        "max_results": int(web.get("max_results") or WEB_SEARCH_MAX_RESULTS),
+                        "max_results": int(web.get("max_results") or WEB_SEARCH_DEFAULT_RESULTS),
                     }
                 })
+                return
+            if path == "/api/conversations/search":
+                query = parse_qs(urlparse(self.path).query)
+                needle = str(query.get("q", [""])[0] or "").strip()
+                try:
+                    limit = int(query.get("limit", ["80"])[0])
+                except (TypeError, ValueError):
+                    limit = 80
+                with FILE_LOCK:
+                    results = search_conversation_index(needle, limit)
+                self._send_json({"results": results})
                 return
             if path == "/api/conversations":
                 query = parse_qs(urlparse(self.path).query)
                 want_archived = str(query.get("archived", ["0"])[0]).lower() in ("1", "true", "yes")
                 with FILE_LOCK:
-                    conversations = load_conversations()
-                conversations = [
-                    item for item in conversations if bool(item.get("archived")) == want_archived
+                    items = load_conversation_index()
+                summaries = [
+                    {key: value for key, value in item.items() if key not in ("search_text", "cache_file", "fingerprint")}
+                    for item in items
+                    if bool(item.get("archived")) == want_archived
                 ]
-                summaries = [conversation_summary(item) for item in conversations]
                 summaries.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
                 self._send_json({"conversations": summaries})
                 return
@@ -6038,8 +7823,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if match:
                 conv_id = unquote(match.group(1))
                 with FILE_LOCK:
-                    conversations = load_conversations()
-                conv = next((item for item in conversations if item.get("id") == conv_id), None)
+                    conv = load_conversation_by_id(conv_id)
                 if not conv:
                     raise ApiError("对话不存在", 404)
                 self._send_json({"conversation": public_conversation(conv)})
@@ -6067,6 +7851,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         raise ApiError("供应商不存在", 404)
                     save_config(config)
                 self._send_json({"ok": True})
+                return
+            prompt_delete_match = re.fullmatch(r"/api/prompts/([^/]+)", path)
+            if prompt_delete_match:
+                self._handle_delete_prompt(unquote(prompt_delete_match.group(1)))
+                return
+            index_delete_match = re.fullmatch(r"/api/memory/index/([^/]+)", path)
+            if index_delete_match:
+                self._handle_delete_memory_index(unquote(index_delete_match.group(1)))
+                return
+            snapshot_delete_match = re.fullmatch(r"/api/memory/snapshots/([^/]+)", path)
+            if snapshot_delete_match:
+                self._handle_delete_memory_snapshot(unquote(snapshot_delete_match.group(1)))
                 return
             match = re.fullmatch(r"/api/conversations/([^/]+)", path)
             if match:
@@ -6166,6 +7962,24 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if prompt_delete:
                 self._handle_delete_prompt(unquote(prompt_delete.group(1)))
                 return
+            if path == "/api/memory/profile":
+                self._handle_save_memory_profile(payload)
+                return
+            index_save_match = re.fullmatch(r"/api/memory/index/([^/]+)", path)
+            if index_save_match:
+                self._handle_save_memory_index(unquote(index_save_match.group(1)), payload)
+                return
+            snapshot_save_match = re.fullmatch(r"/api/memory/snapshots/([^/]+)", path)
+            if snapshot_save_match:
+                self._handle_save_memory_snapshot(unquote(snapshot_save_match.group(1)), payload)
+                return
+            if path == "/api/memory":
+                self._handle_save_memory_settings(payload)
+                return
+            if path == "/api/memory/scan":
+                started = start_memory_scan()
+                self._send_json({"started": started})
+                return
             if path == "/api/settings/web":
                 self._handle_save_web_settings(payload)
                 return
@@ -6207,14 +8021,112 @@ class HarnessHandler(BaseHTTPRequestHandler):
         result = extract_file_text(name, raw)
         self._send_json({"file": result})
 
+    def _handle_save_memory_profile(self, payload: dict) -> None:
+        profile = str(payload.get("profile") or "").strip()
+        if len(profile) > PROFILE_MAX_CHARS:
+            raise ApiError(f"用户画像不能超过 {PROFILE_MAX_CHARS} 字")
+        with FILE_LOCK:
+            memory = load_memory()
+            memory["profile"] = profile
+            save_memory(memory)
+        self._send_json({"ok": True, "profile": profile, "profile_chars": len(profile)})
+
+    def _handle_save_memory_snapshot(self, conv_id: str, payload: dict) -> None:
+        snapshot = str(payload.get("snapshot") or "").strip()
+        if len(snapshot) > MEMORY_SNAPSHOT_EDIT_MAX_CHARS:
+            raise ApiError(f"记忆快照不能超过 {MEMORY_SNAPSHOT_EDIT_MAX_CHARS} 字")
+        with FILE_LOCK:
+            conversations = load_conversations()
+            conv = next((item for item in conversations if item.get("id") == conv_id), None)
+            if conv is None:
+                raise ApiError("对话不存在", 404)
+            conv["memory_snapshot"] = snapshot
+            conv["memory_snapshot_manual"] = True
+            conv["memory_snapshot_updated_at"] = utc_now()
+            save_conversations(conversations)
+            result = memory_snapshot_summary(conv)
+            result["snapshot"] = snapshot
+        self._send_json({"ok": True, "snapshot": result})
+
+    def _handle_save_memory_index(self, conv_id: str, payload: dict) -> None:
+        summary = str(payload.get("summary") or "").strip()
+        raw_keywords = payload.get("keywords")
+        if isinstance(raw_keywords, list):
+            keywords = [str(item).strip()[:40] for item in raw_keywords if str(item).strip()][:10]
+        else:
+            keywords = [item.strip()[:40] for item in re.split(r"[,，\n]+", str(raw_keywords or "")) if item.strip()][:10]
+        if not summary:
+            raise ApiError("索引摘要不能为空")
+        if len(summary) > MEMORY_INDEX_SUMMARY_MAX_CHARS:
+            raise ApiError(f"索引摘要不能超过 {MEMORY_INDEX_SUMMARY_MAX_CHARS} 字，请压缩后保存")
+        with FILE_LOCK:
+            memory = load_memory()
+            entry = _memory_entry(memory, conv_id)
+            if entry is None:
+                raise ApiError("记忆索引不存在", 404)
+            entry["summary"] = summary
+            entry["keywords"] = keywords
+            entry["manual_edit"] = True
+            entry["updated_at"] = utc_now()
+            save_memory(memory)
+        self._send_json({"ok": True, "index": entry})
+
+    def _handle_delete_memory_index(self, conv_id: str) -> None:
+        with FILE_LOCK:
+            memory = load_memory()
+            if _memory_entry(memory, conv_id) is None:
+                raise ApiError("记忆索引不存在", 404)
+            _remove_memory_entry(memory, conv_id)
+            conversations = load_conversations()
+            conv = next((item for item in conversations if item.get("id") == conv_id), None)
+            if conv is not None:
+                conv["memory_excluded"] = True
+                _mark_review_success(memory, conv, False)
+            save_conversations(conversations)
+            save_memory(memory)
+        self._send_json({"ok": True})
+
+    def _handle_delete_memory_snapshot(self, conv_id: str) -> None:
+        with FILE_LOCK:
+            conversations = load_conversations()
+            conv = next((item for item in conversations if item.get("id") == conv_id), None)
+            if conv is None:
+                raise ApiError("对话不存在", 404)
+            conv["memory_snapshot"] = ""
+            conv["memory_snapshot_manual"] = True
+            conv["memory_snapshot_updated_at"] = utc_now()
+            save_conversations(conversations)
+            result = memory_snapshot_summary(conv)
+            result["snapshot"] = ""
+        self._send_json({"ok": True, "snapshot": result})
+
+    def _handle_save_memory_settings(self, payload: dict) -> None:
+        raw_enabled = payload.get("enabled")
+        enabled = raw_enabled is True or str(raw_enabled).lower() in ("1", "true", "yes")
+        provider_id = str(payload.get("provider_id") or "").strip()
+        model_id = str(payload.get("model_id") or "").strip()
+        review_prompt = str(payload.get("review_prompt") or "").strip()
+        if len(review_prompt) > MAX_PROMPT_CHARS:
+            raise ApiError(f"记忆整理提示词不能超过 {MAX_PROMPT_CHARS} 个字符")
+        effective_review_prompt = review_prompt or MEMORY_REVIEW_SYSTEM
+        with FILE_LOCK:
+            config = load_config()
+            settings = config.setdefault("settings", {}).setdefault("memory", {})
+            settings["enabled"] = enabled
+            settings["provider_id"] = provider_id
+            settings["model_id"] = model_id
+            settings["review_prompt"] = review_prompt
+            save_config(config)
+        self._send_json({"memory": {"enabled": enabled, "provider_id": provider_id, "model_id": model_id, "review_prompt": effective_review_prompt, "default_review_prompt": MEMORY_REVIEW_SYSTEM}})
+
     def _handle_save_web_settings(self, payload: dict) -> None:
         api_key = str(payload.get("api_key") or "").strip()
         raw_enabled = payload.get("enabled")
         enabled = raw_enabled is True or str(raw_enabled).lower() in ("1", "true", "yes")
         try:
-            max_results = int(payload.get("max_results") or WEB_SEARCH_MAX_RESULTS)
+            max_results = int(payload.get("max_results") or WEB_SEARCH_DEFAULT_RESULTS)
         except (TypeError, ValueError):
-            max_results = WEB_SEARCH_MAX_RESULTS
+            max_results = WEB_SEARCH_DEFAULT_RESULTS
         max_results = max(1, min(WEB_SEARCH_MAX_RESULTS, max_results))
         with FILE_LOCK:
             config = load_config()
@@ -6248,8 +8160,6 @@ class HarnessHandler(BaseHTTPRequestHandler):
             raise ApiError("请填写提示词名称")
         if len(name) > 80:
             raise ApiError("提示词名称不能超过 80 个字符")
-        if not content:
-            raise ApiError("提示词内容不能为空")
         if len(content) > MAX_PROMPT_CHARS:
             raise ApiError(f"提示词不能超过 {MAX_PROMPT_CHARS} 个字符")
         with FILE_LOCK:
@@ -6495,6 +8405,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             web_api_key = str(web_settings.get("api_key") or "").strip()
             web_enabled = bool(web_search_enabled and web_settings.get("enabled"))
             web_capable = bool(web_settings.get("enabled") and web_api_key)
+            memory_settings = app_settings.get("memory") or {}
+            memory_enabled = bool(memory_settings.get("enabled"))
             if web_search_enabled and not web_settings.get("enabled"):
                 raise ApiError("联网搜索尚未在设置中开启", 400)
             if web_search_enabled and not web_api_key:
@@ -6514,6 +8426,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
             conversations = load_conversations()
             conv = None
+            new_conversation_created = False
             if conversation_id:
                 conv = next(
                     (item for item in conversations if item.get("id") == conversation_id),
@@ -6539,6 +8452,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     raise ApiError("目前只支持修改或重新生成最后一轮问题", 400)
                 target_user, target_assistants = turns[target_index]
             elif conv is None:
+                new_conversation_created = True
                 prompt_id = requested_prompt_id or str(config.get("active_prompt_id") or "")
                 prompt = prompt_by_id(config, prompt_id) or (config.get("prompts") or [DEFAULT_PROMPTS[0]])[0]
                 now = utc_now()
@@ -6549,12 +8463,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "updated_at": now,
                     "messages": [],
                     "archived": False,
+                    "title_auto_generated": False,
                     "prompt_id": prompt.get("id"),
                     "prompt_name": prompt.get("name"),
                     "system_prompt": prompt.get("content"),
                 }
                 conversations.append(conv)
-            elif not conv.get("system_prompt"):
+            elif "system_prompt" not in conv:
                 prompt_id = requested_prompt_id or str(config.get("active_prompt_id") or "")
                 prompt = prompt_by_id(config, prompt_id) or (config.get("prompts") or [DEFAULT_PROMPTS[0]])[0]
                 conv["prompt_id"] = conv.get("prompt_id") or prompt.get("id")
@@ -6564,6 +8479,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             environment_text = str(conv.get("environment") or "")
             if not environment_text or "运行环境" in environment_text:
                 conv["environment"] = build_environment_note()
+            if memory_enabled and not conv.get("memory_snapshot") and not conv.get("memory_snapshot_manual"):
+                conv["memory_snapshot"] = build_memory_snapshot(load_memory(), conversations)
 
             now = utc_now()
             conv["provider_id"] = provider_id
@@ -6614,6 +8531,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
             save_conversations(conversations)
             summary = conversation_summary(conv, with_context=True)
 
+        if new_conversation_created and memory_enabled:
+            start_memory_scan()
+
         # 从这里开始改用 SSE。所有校验均已完成。
         self._start_sse()
         self._emit_sse("meta", {"conversation": summary})
@@ -6630,7 +8550,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
         }
         error_message: str | None = None
         client_gone = False
-        tool_schema = [web_search_tool_schema()] if web_capable else None
+        tool_schema = []
+        if web_capable:
+            tool_schema.append(web_search_tool_schema())
+        if memory_enabled:
+            tool_schema.extend([memory_search_tool_schema(), memory_read_tool_schema(), memory_save_tool_schema()])
+        tool_schema = tool_schema or None
         active_messages = list(upstream_messages)
         tool_round = 0
         try:
@@ -6642,7 +8567,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 tools=tool_schema,
                 web_enabled=web_enabled,
                 web_api_key=web_api_key,
-                web_max_results=int(web_settings.get("max_results") or WEB_SEARCH_MAX_RESULTS),
+                web_max_results=int(web_settings.get("max_results") or WEB_SEARCH_DEFAULT_RESULTS),
+                memory_enabled=memory_enabled,
+                current_conversation_id=str(summary.get("id") or ""),
                 emit=self._emit_sse,
                 assistant=assistant,
             )
@@ -6681,6 +8608,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             assistant.pop("usage", None)
         assistant.pop("status", None)
 
+        auto_title_needed = False
+        auto_title_base = ""
         with FILE_LOCK:
             conversations = load_conversations()
             conv = next(
@@ -6698,9 +8627,44 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 if not conv.get("title"):
                     conv["title"] = make_title(message or fallback_title)
                 save_conversations(conversations)
+                if memory_enabled:
+                    memory = load_memory()
+                    if _touch_memory_entry(memory, conv) is not None:
+                        save_memory(memory)
+                auto_title_base = str(conv.get("title") or "")
+                auto_title_needed = bool(
+                    new_conversation_created
+                    and not assistant.get("error")
+                    and not assistant.get("stopped")
+                    and str(assistant.get("content") or "").strip()
+                    and not conv.get("title_auto_generated")
+                    and len(split_turns(conv.get("messages") or [])) == 1
+                )
                 final_summary = conversation_summary(conv, with_context=True)
             else:
                 final_summary = summary
+
+        if auto_title_needed:
+            generated_title = generate_first_turn_title(config, conv)
+            if generated_title and generated_title != auto_title_base:
+                with FILE_LOCK:
+                    fresh_conversations = load_conversations()
+                    fresh_conv = next(
+                        (item for item in fresh_conversations if item.get("id") == summary.get("id")),
+                        None,
+                    )
+                    if (
+                        fresh_conv is not None
+                        and not fresh_conv.get("title_auto_generated")
+                        and str(fresh_conv.get("title") or "") == auto_title_base
+                        and len(split_turns(fresh_conv.get("messages") or [])) == 1
+                    ):
+                        fresh_conv["title"] = generated_title
+                        fresh_conv["title_auto_generated"] = True
+                        fresh_conv["title_generated_at"] = utc_now()
+                        fresh_conv["updated_at"] = utc_now()
+                        save_conversations(fresh_conversations)
+                        final_summary = conversation_summary(fresh_conv, with_context=True)
 
         if not client_gone:
             try:

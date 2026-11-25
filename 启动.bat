@@ -2,7 +2,7 @@
 setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
-title XiaoXiaoFatFish 1.1
+title XiaoXiaoFatFish
 
 set "PYTHON_EXE="
 where py >nul 2>nul
@@ -20,7 +20,7 @@ if not defined PYTHON_EXE (
     exit /b 1
 )
 
-echo Starting XiaoXiaoFatFish 1.1...
+echo Starting XiaoXiaoFatFish...
 echo.
 %PYTHON_EXE% app.py %*
 set "EXIT_CODE=%ERRORLEVEL%"
